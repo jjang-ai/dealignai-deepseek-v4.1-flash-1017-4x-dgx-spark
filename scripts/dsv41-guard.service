@@ -1,0 +1,16 @@
+[Unit]
+Description=DSV4.1-Flash-1017 TP4 ring engine guard (auto-start at boot, health watchdog, auto-restart)
+After=network-online.target docker.service dsv41-mesh.service ring-forward.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@NODE_USER@
+Environment=HOME=@HOME@
+ExecStart=@REPO@/scripts/dsv41-guard.sh
+Restart=always
+RestartSec=30
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# dsv41 — day-to-day control of the 4x Spark TP4 endpoint (run on the head, from this repository).
+#
+#   ./dsv41 start            start (via the guard service: preflight, cache drop + compaction, boot, watchdog)
+#   ./dsv41 stop             stop the guard and the engine on all four nodes
+#   ./dsv41 restart
+#   ./dsv41 status           guard, engine, KV pool, nodes, MemAvailable per node, endpoint URLs
+#   ./dsv41 logs [rkN] [n]   engine log (head by default), last n lines
+#   ./dsv41 preflight [--bw] check every node (kernel, links, RoCE GIDs, mesh, NCCL, image, weights, hardening)
+#   ./dsv41 test             API suite (chat, responses, messages, tools, images, thinking, kwargs, DSpark) from rk3
+#   ./dsv41 bench            quick decode (code c1/c4/c8) + cold prefill (32k / 128k) from rk3
+#   ./dsv41 validate         the full proof: 5 x 1M LRU, 30-min long-prefix soak, 30-min mixed soak (~1 h 50 min)
+#   ./dsv41 url              endpoint URLs and a curl example
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$HERE/cluster.env" ]] || { echo "no cluster.env: run ./install.sh first (see README)" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$HERE/cluster.env"
+ENG=$HERE/engine
+AK=$(sed -n 's/^API_KEY=//p' "$ENG/.env.tp4" 2>/dev/null | tr -d '"')
+AUTH=(); [[ -n "$AK" ]] && AUTH=(-H "Authorization: Bearer $AK")
+API=http://10.10.100.1:$PORT
+has_guard(){ systemctl list-unit-files dsv41-guard.service >/dev/null 2>&1; }
+to_rk3(){ ssh rk3 "mkdir -p /tmp/dsv41-tests" && scp -q "$@" rk3:/tmp/dsv41-tests/; }
+E=${AK:+DSV41_API_KEY=$AK }
+
+case "${1:-status}" in
+  start)
+    if has_guard; then sudo systemctl start dsv41-guard; echo "guard started; boot takes ~3-4 min: ./dsv41 status"
+    else "$HERE/scripts/ring-preflight.sh" && "$HERE/scripts/drop-caches.sh" && (cd "$ENG" && ./start-tp4.sh serve); fi ;;
+  stop)
+    has_guard && sudo systemctl stop dsv41-guard
+    (cd "$ENG" && ./start-tp4.sh stop) ;;
+  restart) "$0" stop; "$0" start ;;
+  status)
+    echo "guard:  $(systemctl is-active dsv41-guard 2>/dev/null)   $(tail -1 "$HERE/logs/guard/guard.log" 2>/dev/null)"
+    if curl -fsS -m 10 "${AUTH[@]}" "$API/v1/loads" >/dev/null 2>&1; then
+      echo "engine: UP   model $(curl -s -m 10 "${AUTH[@]}" "$API/v1/models" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)"
+    else echo "engine: DOWN (or booting)"; fi
+    L=$(ls -t "$ENG"/logs-tp4/*.log 2>/dev/null | head -1)
+    [[ -n "$L" ]] && echo "KV pool: $(grep -m1 -oE 'max_total_num_tokens=[0-9]+' "$L")"
+    for k in 1 2 3 4; do
+      ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k 'echo "rk'$k' $(hostname)  MemAvailable $(awk "/MemAvailable/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB  up $(uptime -p | cut -c4-)"' 2>/dev/null || echo "rk$k UNREACHABLE"
+    done
+    "$0" url ;;
+  logs)
+    if [[ "${2:-}" == rk[2-4] ]]; then ssh "$2" "docker logs --tail ${3:-100} dsv41-worker 2>&1"; else tail -n "${2:-100}" "$(ls -t "$ENG"/logs-tp4/*.log | head -1)"; fi ;;
+  preflight) shift; "$HERE/scripts/ring-preflight.sh" "$@" ;;
+  test) to_rk3 "$HERE/tests/api_suite.py" && ssh rk3 "python3 /tmp/dsv41-tests/api_suite.py --url $API --model $SERVED_MODEL_NAME ${AK:+--api-key $AK}" ;;
+  bench)
+    to_rk3 "$HERE/bench/bench.py" && ssh rk3 "cd /tmp/dsv41-tests && ${E}DSV41_URL=$API python3 bench.py decode --conc 1,4,8 --kind code --reps 1 && ${E}DSV41_URL=$API python3 bench.py prefill --lens 32000,128000" ;;
+  validate) "$HERE/tests/validate.sh" ;;
+  url)
+    lan=$(hostname -I | awk '{print $1}')
+    echo "endpoint: http://$lan:$PORT/v1 (LAN)  ·  $API/v1 (ring)   model: $SERVED_MODEL_NAME${AK:+   (API key required)}"
+    echo "  curl http://$lan:$PORT/v1/chat/completions -H 'Content-Type: application/json'${AK:+ -H 'Authorization: Bearer \$API_KEY'} \\"
+    echo "    -d '{\"model\":\"$SERVED_MODEL_NAME\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'" ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
+esac

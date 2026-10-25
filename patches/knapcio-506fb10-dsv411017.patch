@@ -1,0 +1,708 @@
+diff --git a/.env.example b/.env.example
+index 945ea57..75a28f4 100644
+--- a/.env.example
++++ b/.env.example
+@@ -182,10 +182,9 @@ DSV41_LOOP_LINE_REPEATS=8
+ # why CONTEXT_LENGTH is capped below; expandable_segments:False is the explicit native mode.
+ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+ 
+-# adapter/prefill_empty_cache.py: after every prefill chunk of a sequence at least this
+-# long, return PyTorch's unused cached blocks to the driver, so a long prompt costs one
+-# chunk's transient instead of the sum over chunks (the native allocator cannot reuse
+-# the previous chunk's smaller indexer-logits buffer). Measured 2026-09-11 on the head:
+-# without it a 34k prompt kept 1-1.5 GB and 64k ran out of memory; with it 100k prompts
+-# complete and the memory comes back after each. 0 disables the hook.
++# adapter/prefill_empty_cache.py: a prefill chunk of a sequence at least this long sets
++# the working set; cached-but-free memory beyond it + 1 GiB goes back to the driver at
++# most every 10 s (the working set stays cached), so a long prompt costs one chunk's
++# transient instead of the sum over chunks. Measured 2026-09-11 on the head: without a
++# hook a 34k prompt kept 1-1.5 GB and 64k ran out of memory. 0 disables the hook.
+ DSV41_PREFILL_EMPTY_CACHE_TOKENS=8192
+diff --git a/.env.tp4.example b/.env.tp4.example
+index 18e63af..ffb8fa2 100644
+--- a/.env.tp4.example
++++ b/.env.tp4.example
+@@ -376,9 +376,10 @@ DSV41_LOOP_LINE_REPEATS=8
+ # than 64 query tokens return NaN logits (REPORT.md section 17). Untested at TP4.
+ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+ 
+-# adapter/prefill_empty_cache.py (in the shared image): after every prefill chunk of a
+-# sequence at least this long, return PyTorch's unused cached blocks so a long prompt
+-# costs one chunk's transient instead of the sum over chunks (REPORT.md section 17b).
++# adapter/prefill_empty_cache.py (in the shared image): a prefill chunk of a sequence at
++# least this long sets the working set; cached-but-free memory beyond it + 1 GiB is
++# returned at most every 10 s, keeping the working set cached, so a long prompt costs one
++# chunk's transient instead of the sum over chunks, without per-chunk driver calls.
+ # The per-chunk indexer buffer is CHUNKED_PREFILL_SIZE x prefix x 4 B per ratio-1 source
+ # layer, ~14 B x chunk x prefix at the peak across layers: at 1M context a 1024-token
+ # chunk peaks around 15 GB, against the ~24 GiB per rank that MEM_FRACTION_STATIC=0.80
+diff --git a/adapter/prefill_empty_cache.py b/adapter/prefill_empty_cache.py
+index c8f8b8c..715abbc 100644
+--- a/adapter/prefill_empty_cache.py
++++ b/adapter/prefill_empty_cache.py
+@@ -1,29 +1,121 @@
+-"""Give a long prefill's transient memory back after every chunk.
+-
+-Each 2048-token chunk of a DeepSeek-V4 prefill scores its queries against the whole
+-prefix so far: the indexer logits are a [chunk, prefix] fp32 buffer per low-ratio
+-source layer (deepseek_v4_backend: _dense_fp4_mqa_logits with max_seqlen_k = the
+-longest compressed length), plus candidate masks and top-k scratch of the same shape.
+-They are freed after the layer, but PyTorch's native caching allocator cannot serve
+-the next chunk's slightly larger request from the smaller cached block, so it
+-cudaMallocs a new one every chunk and reserved memory grows with the SQUARE of the
+-prompt (logs/profile-2026-09-10/REPORT.md sections 15 and 17). On a Spark that
+-reserved memory is host memory: a 34k-token prompt kept 1-1.5 GB, 64k exhausted the
+-head. expandable_segments would coalesce it but produces NaN logits on this stack.
+-
+-This hook calls torch.cuda.empty_cache() after every extend forward whose longest
+-sequence is at least DSV41_PREFILL_EMPTY_CACHE_TOKENS (default 8192): the unused
+-cached blocks go back to the driver, the next chunk allocates fresh, and the peak is
+-one chunk's live set instead of the sum over chunks. Decode CUDA graphs live in
+-private pools and are untouched. Cost: one device sync and a few cudaMalloc/cudaFree
+-per long-prefill chunk (milliseconds against a 300-800 ms chunk). 0 disables it.
++"""Bound the allocator cache that long prefills leave behind, without per-chunk driver calls.
++
++Each chunk of a DeepSeek-V4 prefill scores its queries against the whole prefix so far:
++the indexer logits are a [chunk, prefix] fp32 buffer per low-ratio source layer, plus
++candidate masks and top-k scratch of the same shape. They are freed after the layer and
++stay cached in PyTorch's allocator. On a Spark the GPU allocator's cache is host memory,
++so cached-but-free blocks are RAM the rest of the node cannot use.
++
++The upstream hook called torch.cuda.empty_cache() after every long extend forward: the
++peak stays one chunk's live set, but a 1M prompt is ~128 multi-GB cudaMalloc/cudaFree
++cycles of unified memory.
++
++This hook keeps the scratch cached between chunks and trims instead: after every forward
++(two counter reads), if cached-but-free memory exceeds the working set (the last long
++forward's transient peak) + DSV41_PREFILL_TRIM_GIB (1), the largest free blocks covering
++the working set are held for a moment, empty_cache() returns everything else, and the
++held blocks go back to the cache. The next chunk finds its scratch cached, and the waste
++that mixed batches leave behind (vision, chat and long prompts in one batch) is
++returned. At most every DSV41_PREFILL_TRIM_EVERY_S (10 s).
++
++Measured on 4x GB10, 4.26M-token KV pool: 30-min mixed soak (8 clients) with reserved
++memory flat at ~92.5 GiB and every node >= 2 GiB available; cold 1M prefill unchanged.
++A plain empty_cache() every 10 s cost 17 % of prefill speed (scratch re-malloc).
++
++Do not add max_split_size_mb to PYTORCH_CUDA_ALLOC_CONF: oversize blocks are then not
++reused by the growing indexer scratch, and reserved memory ran away to 110 GiB within
++minutes. expandable_segments would coalesce blocks but produces NaN logits on this stack.
++Decode CUDA graphs live in private pools and are untouched.
++
++DSV41_PREFILL_EMPTY_CACHE_TOKENS (8192): an extend forward with a sequence at least this
++long counts as a long prefill (sets the working set); 0 disables the hook.
++DSV41_PREFILL_MEM_PROBE=1: log allocator vs host memory every 8 long forwards.
+ """
+ import logging
+ import os
++import time
+ 
+ import torch
+ 
+ logger = logging.getLogger(__name__)
++_GIB = 1 << 30
++_TRIM = int(float(os.environ.get('DSV41_PREFILL_TRIM_GIB', '1')) * _GIB)
++_TRIM_EVERY_S = float(os.environ.get('DSV41_PREFILL_TRIM_EVERY_S', '10'))
++_PROBE = os.environ.get('DSV41_PREFILL_MEM_PROBE', '0') not in ('0', '')
++_MIN_HOLD = 64 << 20          # only blocks this large are worth holding through a trim
++
++
++class _Trim:
++    """Per-process state (one scheduler process per TP rank)."""
++
++    def __init__(self):
++        self.last = 0.0
++        self.trims = 0
++        self.working = 0          # bytes: the last long forward's transient peak
++        self.base = 0
++
++    def before_long(self):
++        torch.cuda.reset_peak_memory_stats()
++        self.base = torch.cuda.memory_allocated()
++
++    def after_long(self):
++        self.working = max(0, torch.cuda.max_memory_allocated() - self.base)
++
++    def after(self):
++        reserved, allocated = torch.cuda.memory_reserved(), torch.cuda.memory_allocated()
++        if reserved - allocated <= self.working + _TRIM:
++            return
++        now = time.monotonic()
++        if now - self.last < _TRIM_EVERY_S:
++            return
++        self.last = now
++        self.trims += 1
++        held, kept = [], 0
++        if self.working:
++            # only free blocks this allocation can reuse: default pool (not CUDA-graph or other
++            # private pools), current stream, and stop at once if the allocator had to cudaMalloc
++            stream = torch.cuda.current_stream().cuda_stream
++            free = sorted((b['size'] for seg in torch.cuda.memory_snapshot()
++                           if tuple(seg.get('segment_pool_id', (0, 0))) == (0, 0) and seg.get('stream') == stream
++                           for b in seg['blocks'] if b['state'] == 'inactive' and b['size'] >= _MIN_HOLD),
++                          reverse=True)
++            for size in free:
++                if kept >= self.working:
++                    break
++                before = torch.cuda.memory_reserved()
++                held.append(torch.empty(size, dtype=torch.uint8, device='cuda'))
++                if torch.cuda.memory_reserved() > before:
++                    break
++                kept += size
++        torch.cuda.empty_cache()
++        del held
++        if self.trims <= 3 or self.trims % 50 == 0:
++            logger.warning('DSV41 prefill trim %d: %.2f GiB cached but free, kept %.2f GiB working set -> '
++                           'reserved %.2f GiB', self.trims, (reserved - allocated) / _GIB, kept / _GIB,
++                           torch.cuda.memory_reserved() / _GIB)
++
++
++def _meminfo_gib(key):
++    with open('/proc/meminfo') as f:
++        for line in f:
++            if line.startswith(key + ':'):
++                return int(line.split()[1]) / 1048576
++    return -1.0
++
++
++_probe_n = [0]
++
++
++def _probe(longest):
++    _probe_n[0] += 1
++    if _probe_n[0] % 8:
++        return
++    st = torch.cuda.memory_stats()
++    logger.warning('DSV41_MEM_PROBE longest=%d alloc=%.2f reserved=%.2f peak=%.2f memavail=%.2f '
++                   'segments=%d inactive_split=%.2f',
++                   longest, torch.cuda.memory_allocated() / _GIB, torch.cuda.memory_reserved() / _GIB,
++                   torch.cuda.max_memory_allocated() / _GIB, _meminfo_gib('MemAvailable'),
++                   st.get('segment.all.current', 0), st.get('inactive_split_bytes.all.current', 0) / _GIB)
+ 
+ 
+ def install(module):
+@@ -32,19 +124,34 @@ def install(module):
+         return
+     cls = module.ModelRunner
+     original = cls.forward
++    trim = _Trim()
++
++    def long_extend(forward_batch):
++        if not forward_batch.forward_mode.is_extend_without_speculative():
++            return 0
++        lens = forward_batch.seq_lens_cpu
++        longest = int(lens.max()) if lens is not None and lens.numel() else 0
++        return longest if longest >= threshold else 0
+ 
+     def forward(self, forward_batch, *args, **kwargs):
+-        output = original(self, forward_batch, *args, **kwargs)
++        longest = 0
+         try:
+-            if forward_batch.forward_mode.is_extend_without_speculative():
+-                lens = forward_batch.seq_lens_cpu
+-                longest = int(lens.max()) if lens is not None and lens.numel() else 0
+-                if longest >= threshold:
+-                    torch.cuda.empty_cache()
++            longest = long_extend(forward_batch)
++            if longest:
++                trim.before_long()
+         except Exception as exc:  # bookkeeping must never break a forward
+-            logger.warning('DSV41 prefill empty_cache hook: %s', exc)
++            logger.warning('DSV41 prefill trim hook (before): %s', exc)
++        output = original(self, forward_batch, *args, **kwargs)
++        try:
++            if longest:
++                trim.after_long()
++                if _PROBE:
++                    _probe(longest)
++            trim.after()
++        except Exception as exc:
++            logger.warning('DSV41 prefill trim hook (after): %s', exc)
+         return output
+ 
+     cls.forward = forward
+-    logger.warning('DSV41 prefill empty_cache hook installed (extend forwards with a '
+-                   'sequence >= %d tokens)', threshold)
++    logger.warning('DSV41 prefill trim hook installed (long prefill >= %d tokens; trim above working set + '
++                   '%.2f GiB cached-free, every >= %.0f s)', threshold, _TRIM / _GIB, _TRIM_EVERY_S)
+diff --git a/adapter/sitecustomize.py b/adapter/sitecustomize.py
+index 851ffcd..833cdce 100644
+--- a/adapter/sitecustomize.py
++++ b/adapter/sitecustomize.py
+@@ -259,6 +259,21 @@ class EngramLoader(importlib.abc.Loader):
+         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
+             from loop_abort import install as install_loop_abort
+             install_loop_abort(module)
++        elif module.__name__ == 'sglang.srt.mem_cache.swa_radix_cache':
++            # Gated on DSV41_SWA_EVICT_INTERNAL_FIRST: SWA eviction tombstones internal radix nodes
++            # before evicting any leaf, so long cached sessions are not dropped whole
++            # (adapter/swa_evict_internal_first.py). Gate checked BEFORE the import.
++            if os.environ.get('DSV41_SWA_EVICT_INTERNAL_FIRST', '0').strip() not in ('0', 'off', 'false', ''):
++                from swa_evict_internal_first import install as install_swa_evict
++                install_swa_evict(module)
++        elif module.__name__ == 'sglang.srt.mem_cache.unified_radix_cache':
++            if os.environ.get('DSV41_SWA_PROMPT_TAIL_KEEP', '0').strip() not in ('0', 'off', 'false', ''):
++                from swa_evict_internal_first import install_prompt_tail_floor
++                install_prompt_tail_floor(module)
++        elif module.__name__ == 'sglang.srt.mem_cache.unified_cache.components.swa':
++            if os.environ.get('DSV41_SWA_EVICT_INTERNAL_FIRST', '0').strip() not in ('0', 'off', 'false', ''):
++                from swa_evict_internal_first import install_unified as install_swa_evict_unified
++                install_swa_evict_unified(module)
+         else:
+             # V4.1 ratio-1/2 indexers always call the FP4 DeepGEMM kernel.
+             # SM120 needs its split-128 planner even when the legacy FP8
+@@ -290,6 +305,9 @@ class EngramFinder(importlib.abc.MetaPathFinder):
+                             'sglang.srt.speculative.dspark_components.dspark_draft_sampler',
+                             'sglang.kernels.ops.speculative.dspark.dspark_accept',
+                             'sglang.srt.managers.schedule_batch',
++                            'sglang.srt.mem_cache.swa_radix_cache',
++                            'sglang.srt.mem_cache.unified_cache.components.swa',
++                            'sglang.srt.mem_cache.unified_radix_cache',
+                             'sglang.srt.managers.scheduler',
+                             'sglang.srt.managers.tokenizer_manager',
+                             'sglang.kernels.ops.moe.moe_fused_gate',
+diff --git a/adapter/swa_evict_internal_first.py b/adapter/swa_evict_internal_first.py
+new file mode 100644
+index 0000000..1c0729a
+--- /dev/null
++++ b/adapter/swa_evict_internal_first.py
+@@ -0,0 +1,202 @@
++"""SWA eviction: tombstone internal radix nodes before evicting any leaf (DSV41_SWA_EVICT_INTERNAL_FIRST).
++
++Why (measured on the 4x Spark ring, 2026-10-24, CHUNKED_PREFILL_SIZE=8192): every chunk of a long
++prefill becomes a radix node that keeps ~512 SWA tokens (window 128 + page alignment), so one finished
++~1M session holds ~62.5k SWA tokens. `SWARadixCache.evict` walks a single LRU list over internal nodes
++and leaves. When a new long prefill needs SWA, it reaches the *leaf* of an older session before the
++*internal* chunk nodes of newer sessions, and evicting an unlocked leaf deletes it and cascades through
++its tombstoned ancestors, i.e. drops that whole session's full KV while the full pool is mostly free.
++Result without this adapter: with three ~1M sessions resident, every revisit was a 210 s re-prefill.
++
++What this changes: when SWA tokens must be freed, a first pass walks the same SWA LRU list (oldest
++first, unlocked nodes only, via the cache's own `get_lru_no_lock` / `get_prev_no_lock`) and applies the
++cache's own internal-node action -- `free_swa_segment` + `_tombstone_internal_node` -- to internal nodes
++only. The original `evict` then runs for whatever is still needed (and for all full-pool evictions),
++unchanged. No new state, no new freeing path: only the order of two existing actions.
++
++What is kept: internal nodes with a leaf closer than DSV41_SWA_KEEP_TOKENS below them are skipped in the
++first pass (live SWA tail per cached session). Measured on the ring (1M sessions, 256-token nodes,
++CHUNKED_PREFILL_SIZE=8192): keeping only window+page (384) left older sessions resident but unmatchable
++(A,B,A at 1M missed); keeping one prefill chunk + 2 pages (8704) retained them (A,B,A,C,B,A: every revisit
++2.7-3.4 s with 999k cached tokens). Set DSV41_SWA_KEEP_TOKENS = CHUNKED_PREFILL_SIZE + 512.
++
++Off unless DSV41_SWA_EVICT_INTERNAL_FIRST is set. Two installs, one per cache implementation:
++  - install(module)          sglang.srt.mem_cache.swa_radix_cache       SWARadixCache.evict
++  - install_unified(module)  sglang.srt.mem_cache.unified_cache.components.swa
++                             SWAComponent._evict_device_start / _evict_device_next_node
++The DSV4 serving path in this image uses the unified cache (Python tree core, metrics engine_type=unified);
++the SWARadixCache patch is kept for images that still use it.
++"""
++import dataclasses
++import os
++import time
++
++_ON = os.environ.get("DSV41_SWA_EVICT_INTERNAL_FIRST", "0").strip() not in ("0", "off", "false", "")
++# Live-SWA span kept above every leaf (tokens). Default: window + page. DSV41_SWA_KEEP_TOKENS overrides.
++_KEEP = int(os.environ.get("DSV41_SWA_KEEP_TOKENS", "0") or 0)
++_STATS = {"passes": 0, "tombstoned_nodes": 0, "tombstoned_tokens": 0, "skipped_near_leaf": 0}
++
++
++def _near_short_leaf(node, keep):
++    """True if some leaf lies fewer than `keep` tokens below `node` (its window reaches into `node`)."""
++    stack = [(node, keep)]
++    while stack:
++        n, budget = stack.pop()
++        for c in n.children.values():
++            key = getattr(c, "key", None)
++            length = len(key) if key is not None else len(getattr(c, "value", None) or ())
++            if length >= budget:
++                continue
++            if not c.children:
++                return True
++            stack.append((c, budget - length))
++    return False
++
++
++def install(module):
++    if not _ON:
++        return
++    cls = getattr(module, "SWARadixCache", None)
++    if cls is None or getattr(cls, "_dsv41_internal_first", False):
++        return
++    original_evict = cls.evict
++
++    def evict(self, params):
++        if self.disable or params.swa_num_tokens <= 0:
++            return original_evict(self, params)
++        start = time.perf_counter()
++        keep = _KEEP or (self.sliding_window_size + self.page_size)
++        need = params.swa_num_tokens
++        freed = 0
++        x = self.swa_lru_list.get_lru_no_lock()
++        while freed < need and self.swa_lru_list.in_list(x):
++            x_next = self.swa_lru_list.get_prev_no_lock(x)
++            if len(x.children) > 0 and not x.swa_tombstone and x.swa_lock_ref == 0 and x != self.root_node:
++                if _near_short_leaf(x, keep):
++                    _STATS["skipped_near_leaf"] += 1
++                else:
++                    # identical to the internal-node branch of SWARadixCache.evict
++                    self.token_to_kv_pool_allocator.free_swa_segment(x.value, start_pos=0)
++                    freed += len(x.value)
++                    self.swa_lru_list.remove_node(x)
++                    self._tombstone_internal_node(x)
++                    _STATS["tombstoned_nodes"] += 1
++                    _STATS["tombstoned_tokens"] += len(x.value)
++            x = x_next
++        _STATS["passes"] += 1
++        rest = dataclasses.replace(params, swa_num_tokens=max(0, need - freed))
++        if rest.num_tokens > 0 or rest.swa_num_tokens > 0 or getattr(rest, "mamba_num", 0) > 0:
++            result = original_evict(self, rest)
++        else:
++            from sglang.srt.mem_cache.base_prefix_cache import EvictResult
++            result = EvictResult()
++            self.update_eviction_metrics(freed, start)
++        result.swa_num_tokens_evicted += freed
++        if _STATS["passes"] % 200 == 1:
++            print(f"[swa_evict_internal_first] {_STATS}", flush=True)
++        return result
++
++    cls.evict = evict
++    cls._dsv41_internal_first = True
++    print(f"[swa_evict_internal_first] armed on {cls.__name__}.evict (keep window+page below internal nodes)", flush=True)
++
++
++def install_unified(module):
++    """Unified radix cache: two-phase SWA device-eviction walk.
++
++    Phase 1 walks the SWA LRU (same cursor API) and performs the walk's own internal-node step --
++    `_evict_component_and_detach_lru(target=DEVICE)` + `_cascade_evict` -- on internal nodes only,
++    one mutation per call (the driver drains frees and rechecks capacity between calls). When no
++    eligible internal node is left, phase 2 restarts the original walk at the LRU tail, unchanged.
++    Session-radix mode (cursor partitions) is left entirely to the original walk.
++    """
++    if not _ON:
++        return
++    cls = getattr(module, "SWAComponent", None)
++    if cls is None or getattr(cls, "_dsv41_internal_first", False):
++        return
++    orig_start = cls._evict_device_start
++    orig_next = cls._evict_device_next_node
++    EvictLayer = module.EvictLayer
++
++    def _evict_device_start(self, request_cnt):
++        orig_start(self, request_cnt)
++        self._dsv41_phase = 2 if self.tree_core.enable_session_radix_cache else 1
++
++    def _evict_device_next_node(self, tracker, device_frees, host_frees):
++        if getattr(self, "_dsv41_phase", 2) == 1:
++            ct = self.component_type
++            lru = self.tree_core.lru_lists[ct]
++            if tracker[ct] >= self._evict_device_request_cnt:
++                return None
++            keep = _KEEP or (self.sliding_window_size + self.tree_core.page_size)
++            x = self._evict_device_cursor
++            if x is not None and not lru.in_list(x):
++                x = lru.get_lru_no_lock()
++            while x is not None and lru.in_list(x):
++                x_next = lru.get_prev_no_lock(x)
++                cd = x.component_data[ct]
++                if (len(x.children) > 0 and cd.value is not None and cd.lock_ref == 0
++                        and x is not self.tree_core.root_node):
++                    if _near_short_leaf(x, keep):
++                        _STATS["skipped_near_leaf"] += 1
++                    else:
++                        _STATS["tombstoned_nodes"] += 1
++                        _STATS["tombstoned_tokens"] += len(cd.value)
++                        self.tree_core._evict_component_and_detach_lru(
++                            x, self, target=EvictLayer.DEVICE, tracker=tracker,
++                            device_frees=device_frees, host_frees=host_frees)
++                        self.tree_core._cascade_evict(
++                            x, self, tracker, device_frees=device_frees, host_frees=host_frees)
++                        self._evict_device_cursor = x_next
++                        return None
++                x = x_next
++            # no eligible internal node left: original walk from the LRU tail
++            _STATS["passes"] += 1
++            if _STATS["passes"] % 50 == 1:
++                print(f"[swa_evict_internal_first] {_STATS}", flush=True)
++            self._dsv41_phase = 2
++            self._evict_device_cursor = lru.get_lru_no_lock()
++        return orig_next(self, tracker, device_frees, host_frees)
++
++    cls._evict_device_start = _evict_device_start
++    cls._evict_device_next_node = _evict_device_next_node
++    cls._dsv41_internal_first = True
++    print("[swa_evict_internal_first] armed on unified SWAComponent eviction walk "
++          "(internal nodes first, keep window+page above short leaves)", flush=True)
++
++
++_PT_KEEP = int(os.environ.get("DSV41_SWA_PROMPT_TAIL_KEEP", "0") or 0)
++
++
++def install_prompt_tail_floor(module):
++    """DSV41_SWA_PROMPT_TAIL_KEEP=N: keep the last N prompt tokens' SWA through decode (UnifiedRadixCache.swa_retain_floor).
++
++    A prompt shorter than one prefill chunk is not inserted into the radix tree before it finishes, so during decode
++    `free_swa_out_of_window_slots` frees its SWA up to seqlen - window -- including the prompt's end. The finished
++    insert then tombstones the prompt end, and a revisit (or a turn that diverges after the prompt) cannot end its
++    match there: measured 0 cached tokens on the 2nd visit of a 6k prompt, hits only from the 3rd visit on.
++    `swa_retain_floor` is SGLang's own hook for this (the mamba path uses checkpoint - window); the decode-time
++    eviction promises not to free past it. Returning page_floor(prompt) - N keeps that window live; slots are only
++    freed later than before, never earlier. Cost: <= N SWA tokens per running request.
++    """
++    if _PT_KEEP <= 0:
++        return
++    cls = getattr(module, "UnifiedRadixCache", None)
++    if cls is None or getattr(cls, "_dsv41_prompt_tail", False):
++        return
++    orig = cls.swa_retain_floor
++
++    def swa_retain_floor(self, req):
++        base = orig(self, req)
++        if self._sliding_window_size is None or self.is_chunk_cache():
++            return base
++        prompt = len(getattr(req, "origin_input_ids", None) or ())
++        if prompt <= 0:
++            return base
++        floor = max(0, (prompt // self.page_size) * self.page_size - _PT_KEEP)
++        return floor if base is None else min(base, floor)
++
++    cls.swa_retain_floor = swa_retain_floor
++    cls._dsv41_prompt_tail = True
++    print(f"[swa_prompt_tail] armed: decode keeps the last {_PT_KEEP} prompt tokens' SWA (prompt-end revisits match)", flush=True)
+diff --git a/docs/README-upstream.md b/docs/README-upstream.md
+index 1c02766..159c0a1 100644
+--- a/docs/README-upstream.md
++++ b/docs/README-upstream.md
+@@ -221,7 +221,7 @@ adapter/
+   row_store.cpp          the row store: O_DIRECT reads, 96-thread miss servicing, packed shards
+   mxfp8_b12x.py          routes MXFP8 dense linears to FlashInfer's b12x kernel; repairs the
+                          block scales of padded shards
+-  prefill_empty_cache.py empties the allocator cache after each long prefill chunk (memory)
++  prefill_empty_cache.py trims the allocator cache beyond one prefill chunk's working set (memory)
+ runtime/flash_mla_sm120.py  SM12x sparse-MLA dispatch (64-token page split for FlashInfer)
+ scripts/pack_engram.py   repack one rank's Engram rows (weight+scale adjacent) to local disk
+ scripts/profile/         torch-profiler helper and trace analysers (see Profiling)
+@@ -250,7 +250,7 @@ benchmarks/, tests/      upstream benchmark, row-store, thinking-alias, encoder-
+ | `DSV41_LOOP_LINE_REPEATS` | 8 | identical decoded lines of at least 16 characters. 0 disables the line detector. |
+ | `NCCL_BUFFSIZE` / `NCCL_LL128_BUFFSIZE` / `NCCL_PROTO` / `NCCL_MAX_NCHANNELS` | 1 MiB / 256 KiB / `^LL128` / 8 | NCCL connection buffers: 4.7 GiB → 0.14 GiB pinned per node |
+ | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:False` | never `True`: with expandable segments every prefill of more than 64 query tokens returns NaN logits (garbage for prompts of 65-~4000 tokens and for 3+ concurrent requests; REPORT.md §17). The native allocator fragments on long prompts, hence the context cap |
+-| `DSV41_PREFILL_EMPTY_CACHE_TOKENS` | 8192 | `adapter/prefill_empty_cache.py`: after each prefill chunk of a sequence this long or longer, give the allocator's cached blocks back so a long prompt costs one chunk's transient, not the sum (REPORT.md §17). 0 disables |
++| `DSV41_PREFILL_EMPTY_CACHE_TOKENS` | 8192 | `adapter/prefill_empty_cache.py`: a prefill chunk of a sequence this long or longer sets the working set; cached-but-free memory beyond it + `DSV41_PREFILL_TRIM_GIB` (1) is returned at most every `DSV41_PREFILL_TRIM_EVERY_S` (10 s), so a long prompt costs one chunk's transient, not the sum. 0 disables |
+ | `DSV41_IO_THREADS` | 96 | Engram miss-servicing threads (NVMe does ~112k IOPS at QD 64) |
+ | `DSV41_ENGRAM_KEEPALIVE_MS` | 25 | one 4 KiB read per period while Engram lookups arrived in the last 2 s, so the drive does not enter APST sleep between decode steps (~10 ms wake-up); 0 disables |
+ | `DSV41_CACHE_GIB` | 0 | Engram row cache; 0 because n-gram rows have ~0% reuse and RAM is GPU memory |
+diff --git a/docs/chunked-prefill-memory.md b/docs/chunked-prefill-memory.md
+index eca3449..0de10a4 100644
+--- a/docs/chunked-prefill-memory.md
++++ b/docs/chunked-prefill-memory.md
+@@ -26,8 +26,8 @@ that one buffer the same function keeps, at the same moment:
+ 
+ So the live peak of one chunk is roughly `c × T × L` with `c ≈ 14 B` measured (REPORT §17b:
+ 2.97 GB at T=2048, L=100k; 2.6 GB at T=1024, L=208k; both ≈ 3.5 × 4 B × T × L, plus
+-~0.2-0.35 GB of touched KV pages), and the allocator's cache is emptied after each chunk by
+-`adapter/prefill_empty_cache.py`, so the sum over chunks no longer accumulates.
++~0.2-0.35 GB of touched KV pages), and `adapter/prefill_empty_cache.py` returns cached-but-free
++memory beyond one chunk's working set (at most every 10 s), so the sum over chunks no longer accumulates.
+ 
+ With a 1.5 GB guard and ~0.5 GB of margin the usable budget is about 2.5-3 GB, which gives
+ the rule that every measurement so far obeys:
+diff --git a/tests/test_swa_evict_internal_first.py b/tests/test_swa_evict_internal_first.py
+new file mode 100644
+index 0000000..1aa0e73
+--- /dev/null
++++ b/tests/test_swa_evict_internal_first.py
+@@ -0,0 +1,194 @@
++"""CPU test for adapter/swa_evict_internal_first.py with a stub SWARadixCache (same attribute/API names).
++
++Run: DSV41_SWA_EVICT_INTERNAL_FIRST=1 python3 tests/test_swa_evict_internal_first.py
++"""
++import dataclasses, os, sys, types
++os.environ["DSV41_SWA_EVICT_INTERNAL_FIRST"] = "1"
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "adapter"))
++
++# minimal stand-in for sglang.srt.mem_cache.base_prefix_cache.EvictResult
++bpc = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
++@dataclasses.dataclass
++class EvictResult:
++    num_tokens_evicted: int = 0
++    swa_num_tokens_evicted: int = 0
++    mamba_num_evicted: int = 0
++@dataclasses.dataclass
++class EvictParams:
++    num_tokens: int = 0
++    swa_num_tokens: int = 0
++    mamba_num: int = 0
++bpc.EvictResult = EvictResult
++for name in ("sglang", "sglang.srt", "sglang.srt.mem_cache"):
++    sys.modules.setdefault(name, types.ModuleType(name))
++sys.modules["sglang.srt.mem_cache.base_prefix_cache"] = bpc
++
++import swa_evict_internal_first as ad
++
++
++class Node:
++    _id = 0
++    def __init__(self, n, parent=None):
++        Node._id += 1; self.id = Node._id
++        self.value = list(range(n)); self.key = self.value
++        self.children = {}; self.parent = parent
++        self.swa_tombstone = False; self.swa_lock_ref = 0; self.full_lock_ref = 0
++        if parent is not None: parent.children[self.id] = self
++
++
++class LRU:  # oldest first; mirrors get_lru_no_lock / get_prev_no_lock / remove_node / in_list
++    def __init__(self, nodes): self.order = list(nodes)
++    def get_lru_no_lock(self): return next((n for n in self.order if n.swa_lock_ref == 0), None)
++    def get_prev_no_lock(self, node):
++        i = self.order.index(node)
++        return next((n for n in self.order[i + 1:] if n.swa_lock_ref == 0), None)
++    def remove_node(self, node): self.order.remove(node)
++    def in_list(self, node): return node is not None and node in self.order
++
++
++class Alloc:
++    def __init__(self): self.freed = 0
++    def free_swa_segment(self, value, start_pos=0): self.freed += len(value)
++
++
++class SWARadixCache:
++    def __init__(self, root, nodes):
++        self.root_node = root; self.disable = False; self.sliding_window_size = 128; self.page_size = 256
++        self.swa_lru_list = LRU(nodes); self.token_to_kv_pool_allocator = Alloc(); self.swa_evictable_size_ = 0
++        self.orig_calls = []
++    def _tombstone_internal_node(self, node):
++        assert node.children; node.swa_tombstone = True
++    def update_eviction_metrics(self, n, t): pass
++    def evict(self, params):  # "original": records what is left for it
++        self.orig_calls.append(params)
++        return EvictResult(num_tokens_evicted=params.num_tokens, swa_num_tokens_evicted=params.swa_num_tokens)
++
++
++mod = types.SimpleNamespace(SWARadixCache=SWARadixCache)
++ad.install(mod)
++
++# Two sessions, each a chain of 3 chunk nodes of 512 SWA tokens + a 512-token leaf; session A is older.
++root = Node(0)
++def session():
++    a = Node(512, root); b = Node(512, a); c = Node(512, b); leaf = Node(512, c); return [a, b, c, leaf]
++A = session(); B = session()
++cache = SWARadixCache(root, A + B)          # LRU order: A's internals, A's leaf, B's internals, B's leaf
++
++# Need 2048 SWA tokens: the stock order would take A0,A1,A2 then A's LEAF (deleting session A).
++r = cache.evict(EvictParams(swa_num_tokens=2048))
++taken = [n for n in A + B if n.swa_tombstone]
++assert A[3] not in taken and B[3] not in taken, "a leaf was tombstoned"
++assert taken == [A[0], A[1], A[2], B[0]], [n.id for n in taken]
++assert r.swa_num_tokens_evicted == 2048 and cache.orig_calls == [], r
++print("PASS internal nodes of both sessions go before any leaf; no fallback needed")
++
++# Short-leaf protection: a 64-token leaf under an internal node -> that node is skipped.
++root2 = Node(0); p = Node(512, root2); short = Node(64, p); q = Node(512, root2); q2 = Node(512, q)
++c2 = SWARadixCache(root2, [p, short, q, q2])
++c2.evict(EvictParams(swa_num_tokens=512))
++assert not p.swa_tombstone and q.swa_tombstone, "parent of a short leaf must be kept"
++print("PASS parent of a < window+page leaf is protected")
++
++# Not enough internal SWA: the remainder goes to the original evict, full evictions pass through.
++root3 = Node(0); i3 = Node(512, root3); l3 = Node(512, i3)
++c3 = SWARadixCache(root3, [i3, l3])
++r3 = c3.evict(EvictParams(num_tokens=100, swa_num_tokens=1000))
++assert i3.swa_tombstone and c3.orig_calls == [EvictParams(num_tokens=100, swa_num_tokens=488)], c3.orig_calls
++assert r3.swa_num_tokens_evicted == 1000 and r3.num_tokens_evicted == 100, r3
++print("PASS remainder (and full-pool eviction) delegated to the original evict")
++
++# SWA not needed: untouched delegation.
++c4 = SWARadixCache(root3, [])
++c4.evict(EvictParams(num_tokens=7)); assert c4.orig_calls == [EvictParams(num_tokens=7)]
++print("PASS full-only eviction is passed through unchanged")
++print("all passed")
++
++
++# ---------------- unified cache (SWAComponent eviction walk) ----------------
++import enum
++class EvictLayer(enum.Enum):
++    DEVICE = 1
++class CD:
++    def __init__(self, n): self.value = list(range(n)); self.lock_ref = 0
++class UNode:
++    _id = 0
++    def __init__(self, n, parent=None):
++        UNode._id += 1; self.id = UNode._id; self.key = list(range(n)); self.children = {}; self.parent = parent
++        self.component_data = {"swa": CD(n)}
++        if parent is not None: parent.children[self.id] = self
++class ULRU:
++    def __init__(self, nodes): self.order = list(nodes)
++    def get_lru_no_lock(self): return next((n for n in self.order if n.component_data["swa"].lock_ref == 0), None)
++    def get_prev_no_lock(self, node, check_id=True):
++        i = self.order.index(node); return next((n for n in self.order[i + 1:] if n.component_data["swa"].lock_ref == 0), None)
++    def remove_node(self, node): self.order.remove(node)
++    def in_list(self, node): return node is not None and node in self.order
++class TreeCore:
++    def __init__(self, root, nodes):
++        self.root_node = root; self.page_size = 256; self.enable_session_radix_cache = False
++        self.lru_lists = {"swa": ULRU(nodes)}; self.deleted = []
++        self.evictable_device_leaves = {n for n in nodes if not n.children}
++    def _evict_component_and_detach_lru(self, x, comp, target, tracker, device_frees, host_frees):
++        tracker["swa"] += len(x.component_data["swa"].value); x.component_data["swa"].value = None
++        self.lru_lists["swa"].remove_node(x)
++    def _cascade_evict(self, x, comp, tracker, device_frees, host_frees): pass
++class SWAComponent:  # original walk, simplified to the same contract
++    component_type = "swa"; sliding_window_size = 128
++    def _evict_device_start(self, request_cnt):
++        self._evict_device_request_cnt = request_cnt; self._evict_device_cursor = self.tree_core.lru_lists["swa"].get_lru_no_lock()
++    def _evict_device_next_node(self, tracker, device_frees, host_frees):
++        lru = self.tree_core.lru_lists["swa"]; x = self._evict_device_cursor
++        if tracker["swa"] >= self._evict_device_request_cnt or x is None or not lru.in_list(x): return None
++        if x in self.tree_core.evictable_device_leaves:
++            self._evict_device_cursor = lru.get_prev_no_lock(x); return x.id
++        nxt = lru.get_prev_no_lock(x)
++        self.tree_core._evict_component_and_detach_lru(x, self, EvictLayer.DEVICE, tracker, device_frees, host_frees)
++        self._evict_device_cursor = nxt; return None
++
++def drive(comp, need):  # the driver loop of UnifiedRadixCache
++    from collections import defaultdict
++    tracker = defaultdict(int); deleted = []
++    comp._evict_device_start(need)
++    while True:
++        before = dict(tracker)
++        nid = comp._evict_device_next_node(tracker, {}, {})
++        if nid is None:
++            if tracker == before: break
++        else:
++            deleted.append(nid); node = next(n for n in comp.tree_core.lru_lists["swa"].order if n.id == nid)
++            tracker["swa"] += len(node.component_data["swa"].value); comp.tree_core.lru_lists["swa"].remove_node(node)
++    return tracker["swa"], deleted
++
++umod = types.SimpleNamespace(SWAComponent=SWAComponent, EvictLayer=EvictLayer)
++ad.install_unified(umod)
++uroot = UNode(0)
++def usession():
++    a = UNode(512, uroot); b = UNode(512, a); c = UNode(512, b); leaf = UNode(512, c); return [a, b, c, leaf]
++UA = usession(); UB = usession()
++comp = SWAComponent(); comp.tree_core = TreeCore(uroot, UA + UB)
++freed, deleted = drive(comp, 2048)
++assert deleted == [] and freed == 2048, (freed, deleted)
++assert [n for n in UA + UB if n.component_data["swa"].value is None] == [UA[0], UA[1], UA[2], UB[0]]
++print("PASS unified walk: internal chunk nodes of both sessions before any leaf (no session deleted)")
++comp2 = SWAComponent(); r2 = UNode(0); i2 = UNode(512, r2); l2 = UNode(512, i2); comp2.tree_core = TreeCore(r2, [i2, l2])
++freed2, deleted2 = drive(comp2, 1000)
++assert freed2 >= 1000 and deleted2 == [l2.id], (freed2, deleted2)
++print("PASS unified walk: falls back to the original leaf eviction when internals are exhausted")
++print("unified passed")
++
++
++# ---------------- prompt-tail SWA retain floor (UnifiedRadixCache.swa_retain_floor) ----------------
++ad._PT_KEEP = 1024
++class URC:
++    page_size = 256; _sliding_window_size = 128; _chunk = False; _mamba = None
++    def is_chunk_cache(self): return self._chunk
++    def swa_retain_floor(self, req): return self._mamba
++class R:
++    def __init__(self, n): self.origin_input_ids = list(range(n))
++ad.install_prompt_tail_floor(types.SimpleNamespace(UnifiedRadixCache=URC))
++c = URC()
++assert c.swa_retain_floor(R(5978)) == 5888 - 1024, c.swa_retain_floor(R(5978))      # page floor(5978)=5888, keep 1024
++assert c.swa_retain_floor(R(300)) == 0                                                # short prompt: keep everything
++c._mamba = 1000; assert c.swa_retain_floor(R(5978)) == 1000                           # an existing (mamba) floor wins if lower
++c._mamba = None; c._chunk = True; assert c.swa_retain_floor(R(5978)) is None          # chunk cache: unchanged
++print("PASS prompt-tail retain floor: page-aligned, clamped at 0, min() with an existing floor, chunk cache untouched")

@@ -1,0 +1,27 @@
+DeepSeek-V4.1-Flash-1017 on 4x DGX Spark (switchless ring, TP4) — deployment package
+
+This package (install.sh, config/, scripts/, fabric/, tests/, bench/, examples/, docs/ and
+patches/knapcio-506fb10-dsv411017.patch) is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version. See LICENSE.
+It is distributed WITHOUT ANY WARRANTY; see the License for details.
+
+It deploys, but does not vendor, the following work; each keeps its own licence:
+
+- Engine: knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4 (AGPL-3.0-or-later); its own NOTICE,
+  kept in the clone, lists its upstreams and third-party components. install.sh clones it at
+  commit 506fb10 and applies patches/knapcio-506fb10-dsv411017.patch, a modification of that
+  AGPL work.
+- SGLang (sgl-project/sglang), Apache License 2.0, inside the engine image.
+- b12x / RoCEnante (local-inference-lab/b12x) and rhys101's SGLang RoCEnante overlay, inside
+  the engine image; Apache License 2.0.
+- sparkring (FujitsuPolycom/sparkring, commit f16b5f4), Apache License 2.0: fabric planner and
+  RDMA-TX marker used by `install.sh mesh` (cloned, not vendored).
+- Switchless ring NCCL: alexellis/switchless-nccl (prebuilt v0.0.1 bundle) and
+  ondigo-winder/SWITCHLESS-NCCL-RING-4-GB10 (4-HCA build), downloaded by `install.sh nccl`;
+  NVIDIA NCCL v2.30.7-1, BSD-3-Clause.
+- patches/nccl-2393-aarch64-cts-fence.patch is Stanislav Bardyuk's change from NVIDIA/nccl
+  PR #2393 (commit b85c5d9c4aa5), backported to NCCL v2.30.7-1; Apache License 2.0.
+- The model (dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8, derived from
+  deepseek-ai/DeepSeek-V4.1-Flash) keeps its own licence; this package does not redistribute
+  model weights.

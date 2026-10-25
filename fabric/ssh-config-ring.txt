@@ -1,0 +1,15 @@
+# --- spark ring (CX7 fabric node IPs) ---
+Host rk1
+    HostName 10.10.100.1
+Host rk2
+    HostName 10.10.100.2
+Host rk3
+    HostName 10.10.100.3
+Host rk4
+    HostName 10.10.100.4
+Host rk1 rk2 rk3 rk4
+    User @NODE_USER@
+    IdentityFile ~/.ssh/id_ed25519
+    Compression no
+    Ciphers aes128-gcm@openssh.com
+# --- end spark ring ---

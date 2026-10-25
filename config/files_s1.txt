@@ -1,0 +1,8 @@
+model-00048-of-00048.safetensors
+model-00047-of-00048.safetensors
+model-00042-of-00048.safetensors
+model-00040-of-00048.safetensors
+model-00012-of-00048.safetensors
+model-00008-of-00048.safetensors
+model-00006-of-00048.safetensors
+model-00003-of-00048.safetensors
