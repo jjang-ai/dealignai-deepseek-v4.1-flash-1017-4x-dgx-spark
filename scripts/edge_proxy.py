@@ -13,6 +13,7 @@ balancers) cuts it. This proxy sits between such a proxy and the engine:
 
 Run (scripts/dsv41-edge.sh does this): the engine image's python, host network, listen on 127.0.0.1:EDGE_PORT, and
 point the tunnel / reverse proxy at it instead of the engine port. Clients on the LAN can keep using the engine port.
+It also accepts the API key as `x-api-key` / `api-key` (Anthropic-style clients) and collapses a doubled /v1/v1/ path.
 Env: UPSTREAM (http://127.0.0.1:8888), EDGE_HOST (127.0.0.1), EDGE_PORT (8890), GRACE (20), PING (15).
 """
 import asyncio, json, os
@@ -29,6 +30,24 @@ def fwd_headers(h):
     return {k: v for k, v in h.items() if k.lower() not in HOP}
 
 
+def up_headers(h):
+    """Request headers for the engine. The engine takes the key only as `Authorization: Bearer`; Anthropic clients
+    send `x-api-key` (others `api-key`), so those become a Bearer header when no Authorization is present."""
+    out = fwd_headers(h)
+    if not any(k.lower() == "authorization" for k in out):
+        key = next((v for k, v in out.items() if k.lower() in ("x-api-key", "api-key")), None)
+        if key:
+            out["Authorization"] = "Bearer " + key
+    return out
+
+
+def up_path(path_qs):
+    """A base URL that already ends in /v1 plus a client that appends /v1/... gives /v1/v1/...: collapse it."""
+    while path_qs.startswith("/v1/v1/"):
+        path_qs = path_qs[3:]
+    return path_qs
+
+
 async def handle(request: web.Request):
     body = await request.read()
     wants_stream = False
@@ -38,8 +57,8 @@ async def handle(request: web.Request):
         except Exception:
             pass
     sess: ClientSession = request.app["session"]
-    up = asyncio.ensure_future(sess.request(request.method, UPSTREAM + request.rel_url.path_qs,
-                                            headers=fwd_headers(request.headers), data=body or None))
+    up = asyncio.ensure_future(sess.request(request.method, UPSTREAM + up_path(request.rel_url.path_qs),
+                                            headers=up_headers(request.headers), data=body or None))
     resp = None
     try:
         r = await asyncio.wait_for(asyncio.shield(up), GRACE)

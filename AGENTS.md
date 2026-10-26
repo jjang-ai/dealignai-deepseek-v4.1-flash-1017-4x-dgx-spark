@@ -85,6 +85,7 @@ which question, and the known failures with their fixes. Work from evidence: run
 | `shards N/48` or `engram packs: 0` in preflight | weights or Engram packs missing on that node | `./install.sh weights`, `./install.sh engram` |
 | guard log `more than 6 restarts in an hour — holding` | a persistent failure | read the newest `logs/guard/fail-*/`, fix, then `sudo systemctl restart dsv41-guard` |
 | health OK but `/v1/models` 401 | `API_KEY` is set | send `Authorization: Bearer <key>` |
+| "API key is invalid" from an Anthropic-style client (Claude Code, Agent SDK); engine log `POST /v1/v1/messages?beta=true 401` | client sends `x-api-key`, which SGLang ignores; base URL ends in `/v1` | go through the edge proxy (maps `x-api-key` to Bearer, collapses `/v1/v1/`), or use `ANTHROPIC_AUTH_TOKEN` and a base URL without `/v1` |
 
 ## 4. A node went down
 
@@ -144,7 +145,7 @@ which question, and the known failures with their fixes. Work from evidence: run
 - Sampling kwargs accepted: temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, frequency_penalty, stop,
   n, logprobs/top_logprobs. `seed` with temperature > 0 is not reproducible under DSpark (greedy is deterministic).
 - API key: `./dsv41 key <key>` (writes `cluster.env`, regenerates the profile, restarts). Clients send
-  `Authorization: Bearer <key>`; SGLang does not read `x-api-key`. Without the key: 401 on every API route; `/health` and
+  `Authorization: Bearer <key>`; SGLang does not read `x-api-key` (the edge proxy converts it). Without the key: 401 on every API route; `/health` and
   `/metrics` stay open. The guard, `dsv41`, tests and examples read the key from `engine/.env.tp4` / `DSV41_API_KEY`.
 - Model ids: the served name plus `DSV41_MODEL_ALIASES` (`DeepSeek-V4.1-Flash-1017`, `DeepSeek-V4.1-Flash`, `DeepSeek`,
   `deepseek`); boot log `DSV41 model aliases: ... (2 routes)`.
