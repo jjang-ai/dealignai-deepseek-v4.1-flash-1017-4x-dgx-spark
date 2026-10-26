@@ -13,7 +13,11 @@
 #   4. dsv41-blackbox.service: 1 s samples of memory, PSI, GPU temp/power/clock/throttle, CPU
 #      temp, CX7 carrier and new Xid lines, fsync'd to /var/log/dsv41-blackbox (7 days), so the
 #      last seconds before a crash survive it
+#   5. logrotate for the engine's container logs and log file (copytruncate: works on a running engine).
+#      Docker's json-file logs have no size cap by default; a log-opts cap only applies after a docker restart,
+#      which would stop the engine, so rotation is done from outside.
 # hung_task_panic stays 0: long blocking NCCL/driver waits are legitimate under 1M prefills.
+# usage: node-hardening.sh [ENGINE_LOG_DIR]   (the head passes <engine>/logs-tp4)
 set -euo pipefail
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -51,6 +55,20 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload; systemctl enable -q dsv41-blackbox; systemctl restart dsv41-blackbox
 
+LOGDIR=${1:-}
+block(){ echo "$1 {"; [ -n "${2:-}" ] && echo "  su $2"; printf '  %s\n' "size 200M" "rotate 3" compress missingok notifempty copytruncate; echo "}"; }
+{
+  block "/var/lib/docker/containers/*/*-json.log"
+  [ -n "$LOGDIR" ] && [ -d "$LOGDIR" ] && block "$LOGDIR/*.log" "$(stat -c '%U %G' "$LOGDIR")"   # user-owned dir: rotate as its owner
+} > /etc/logrotate.d/dsv41
+logrotate -d /etc/logrotate.d/dsv41 >/dev/null 2>&1 || echo "warning: logrotate config check failed"
+# hourly check, so a busy engine cannot outgrow the daily run
+cat > /etc/cron.hourly/dsv41-logrotate <<'EOF2'
+#!/bin/sh
+exec /usr/sbin/logrotate /etc/logrotate.d/dsv41
+EOF2
+chmod 755 /etc/cron.hourly/dsv41-logrotate
+
 echo "$(hostname): panic=$(sysctl -n kernel.panic) oops=$(sysctl -n kernel.panic_on_oops) soft=$(sysctl -n kernel.softlockup_panic)" \
      "hard=$(sysctl -n kernel.hardlockup_panic 2>/dev/null || echo n/a) min_free=$(sysctl -n vm.min_free_kbytes)" \
-     "watchdog=$(systemctl show -p RuntimeWatchdogUSec --value) blackbox=$(systemctl is-active dsv41-blackbox)"
+     "watchdog=$(systemctl show -p RuntimeWatchdogUSec --value) blackbox=$(systemctl is-active dsv41-blackbox) logrotate=$([ -f /etc/logrotate.d/dsv41 ] && echo on)"

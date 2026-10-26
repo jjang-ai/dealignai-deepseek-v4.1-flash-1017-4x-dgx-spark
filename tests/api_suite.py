@@ -276,11 +276,11 @@ def t_completions():
     c = r["choices"][0]["text"] if s == 200 else str(r); return s == 200 and "paris" in c.lower(), repr(c)
 
 def t_responses():
-    s, r = req("/v1/responses", {"model": MODEL, "input": "What is 6*7? Number only.", "max_output_tokens": 16})
+    s, r = req("/v1/responses", {"model": MODEL, "temperature": 0, "input": "What is 6*7? Number only.", "max_output_tokens": 16})
     txt = json.dumps(r) if s == 200 else str(r); return s == 200 and "42" in txt, f"{s} {txt[:160]}"
 
 def t_messages():
-    s, r = req("/v1/messages", {"model": MODEL, "max_tokens": 16, "messages": [{"role": "user", "content": "What is 6*7? Number only."}]})
+    s, r = req("/v1/messages", {"model": MODEL, "temperature": 0, "max_tokens": 16, "messages": [{"role": "user", "content": "What is 6*7? Number only."}]})
     txt = json.dumps(r); return s == 200 and "42" in txt, f"{s} {txt[:160]}"
 
 def t_sampling_kwargs():
@@ -294,31 +294,31 @@ def sse(path, body):
         return resp.read().decode()
 
 def t_responses_stream():
-    t = sse("/v1/responses", {"model": MODEL, "input": "Count to five.", "max_output_tokens": 40, "stream": True})
+    t = sse("/v1/responses", {"model": MODEL, "temperature": 0, "input": "Count to five.", "max_output_tokens": 40, "stream": True})
     ok = all(e in t for e in ("response.created", "response.output_text.delta", "response.completed"))
     return ok, f"{t.count('output_text.delta')} text deltas"
 
 def t_responses_image():
-    s, r = req("/v1/responses", {"model": MODEL, "instructions": "Answer with one English word.", "max_output_tokens": 20,
+    s, r = req("/v1/responses", {"model": MODEL, "temperature": 0, "instructions": "Answer with one English word.", "max_output_tokens": 20,
                                  "input": [{"role": "user", "content": [{"type": "input_text", "text": "What colour is this image?"},
                                                                          {"type": "input_image", "image_url": data_uri(SOLID_RED)}]}]})
     txt = " ".join(c.get("text", "") for o in r.get("output", []) for c in o.get("content", []) if isinstance(c, dict)) if s == 200 else str(r)
     return s == 200 and "red" in txt.lower(), repr(txt[:80])
 
 def t_responses_tools():
-    s, r = req("/v1/responses", {"model": MODEL, "input": "What is the weather in Paris? Use the tool.", "max_output_tokens": 200,
+    s, r = req("/v1/responses", {"model": MODEL, "temperature": 0, "input": "What is the weather in Paris? Use the tool.", "max_output_tokens": 200,
                                  "tools": [{"type": "function", "name": "get_weather", "description": "Get the weather for a city",
                                             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]})
     calls = [o for o in r.get("output", []) if o.get("type") == "function_call"] if s == 200 else []
     return bool(calls) and calls[0].get("name") == "get_weather" and "paris" in calls[0].get("arguments", "").lower(), repr(calls[:1])
 
 def t_responses_reasoning():
-    s, r = req("/v1/responses", {"model": MODEL, "input": "Is 91 prime? Answer yes or no.", "reasoning": {"effort": "high"}, "max_output_tokens": 1500})
+    s, r = req("/v1/responses", {"model": MODEL, "temperature": 0, "input": "Is 91 prime? Answer yes or no.", "reasoning": {"effort": "high"}, "max_output_tokens": 1500})
     kinds = [o.get("type") for o in r.get("output", [])] if s == 200 else []
     return s == 200 and "reasoning" in kinds and "message" in kinds, repr(kinds)
 
 def t_messages_image():
-    s, r = req("/v1/messages", {"model": MODEL, "max_tokens": 20, "system": "Answer with one English word.",
+    s, r = req("/v1/messages", {"model": MODEL, "temperature": 0, "max_tokens": 20, "system": "Answer with one English word.",
                                 "messages": [{"role": "user", "content": [
                                     {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                                                  "data": base64.b64encode(SOLID_BLUE).decode()}},
@@ -327,20 +327,20 @@ def t_messages_image():
     return s == 200 and "blue" in txt.lower(), repr(txt[:80])
 
 def t_messages_tools():
-    s, r = req("/v1/messages", {"model": MODEL, "max_tokens": 200, "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}],
+    s, r = req("/v1/messages", {"model": MODEL, "temperature": 0, "max_tokens": 200, "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}],
                                 "tools": [{"name": "get_weather", "description": "Get the weather for a city",
                                            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]})
     uses = [c for c in r.get("content", []) if c.get("type") == "tool_use"] if s == 200 else []
     return bool(uses) and uses[0].get("input", {}).get("city", "").lower() == "paris" and r.get("stop_reason") == "tool_use", repr(uses[:1])
 
 def t_messages_thinking():
-    s, r = req("/v1/messages", {"model": MODEL, "max_tokens": 2000, "thinking": {"type": "enabled", "budget_tokens": 1024},
+    s, r = req("/v1/messages", {"model": MODEL, "temperature": 0, "max_tokens": 2000, "thinking": {"type": "enabled", "budget_tokens": 1024},
                                 "messages": [{"role": "user", "content": "Is 91 prime? Answer yes or no."}]})
     kinds = [c.get("type") for c in r.get("content", [])] if s == 200 else str(r)
     return s == 200 and "thinking" in kinds and "text" in kinds, repr(kinds)
 
 def t_messages_stream():
-    t = sse("/v1/messages", {"model": MODEL, "max_tokens": 30, "stream": True, "messages": [{"role": "user", "content": "Count to five."}]})
+    t = sse("/v1/messages", {"model": MODEL, "temperature": 0, "max_tokens": 30, "stream": True, "messages": [{"role": "user", "content": "Count to five."}]})
     ok = all(e in t for e in ("message_start", "content_block_delta", "message_stop"))
     return ok, f"{t.count('content_block_delta')} deltas"
 

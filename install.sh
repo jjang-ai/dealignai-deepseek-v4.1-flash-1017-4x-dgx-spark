@@ -147,7 +147,7 @@ cmd_mesh(){
 cmd_hardening(){   # crash -> auto-reboot, hardware watchdog, uniform min_free, black-box recorder (scripts/node-hardening.sh)
   for r in "${ALL[@]}"; do
     scp -q "$HERE/scripts/node-hardening.sh" "$HERE/scripts/dsv41-blackbox.py" "$NODE_USER@$(lan "$r"):/tmp/"
-    on "$r" 'sudo bash /tmp/node-hardening.sh'
+    if [[ $r == 0 ]]; then on "$r" "sudo bash /tmp/node-hardening.sh $WORK/engine/logs-tp4"; else on "$r" 'sudo bash /tmp/node-hardening.sh'; fi
   done
 }
 

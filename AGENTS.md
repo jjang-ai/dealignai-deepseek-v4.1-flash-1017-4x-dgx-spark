@@ -44,6 +44,10 @@ which question, and the known failures with their fixes. Work from evidence: run
 | what did the engine say? | `./dsv41 logs 300`, `./dsv41 logs rk3 300` |
 | does the API work? | `./dsv41 test` (42 checks) |
 | is it as fast as it should be? | `./dsv41 bench` and compare with docs/RESULTS.md |
+| what is using memory / disk on each node? | `./dsv41 mem`, `./dsv41 disk` |
+| free the machines for other work | `./dsv41 unload` (and `./dsv41 load` afterwards) |
+| reboot a node safely | `./dsv41 reboot rkN` (stops the engine first, starts it when the node is back) |
+| collect everything for a bug report | `./dsv41 diag` |
 
 ## 1. Cabling and links
 
@@ -62,7 +66,7 @@ which question, and the known failures with their fixes. Work from evidence: run
 
 | preflight / log symptom | cause | fix |
 |---|---|---|
-| `gid3=0000:0000` on all four ports of one node; boot fails with `NCCL error: invalid usage` | that node stayed up while neighbours rebooted; it lost its RoCEv2 IPv4 GIDs | on that node, per fabric interface: `a=$(ip -4 -o addr show <if> \| awk '{print $4}'); sudo ip addr del $a dev <if>; sudo ip addr add $a dev <if>`; preflight must pass |
+| `gid3=0000:0000` on all four ports of one node; boot fails with `NCCL error: invalid usage` | that node stayed up while neighbours rebooted; it lost its RoCEv2 IPv4 GIDs | `scripts/fabric-heal.sh` (the guard and `./dsv41 start` run it before every boot; it also restarts an inactive `dsv41-mesh`). By hand, on that node, per fabric interface: `a=$(ip -4 -o addr show <if> \| awk '{print $4}'); sudo ip addr del $a dev <if>; sudo ip addr add $a dev <if>`; preflight must pass |
 | RoCEv2 GID at index 5, not 3 | NetworkManager stable-privacy IPv6 adds a second link-local | `nmcli con mod ring-<if> ipv6.addr-gen-mode eui64` (install.sh fabric does it) |
 | `meshroute ... MISSING`; boot fails with `ibv_modify_qp(RTR): Connection timed out` on ranks next to a rebooted node | NetworkManager flushed the opposite-node /32 routes | `./install.sh mesh` (re-runs `fabric/mesh-routes-to-nm.sh`, which makes them persistent) |
 | `markers` not 2 / `dsv41-mesh` inactive / `tc rules not in hardware` | mesh unit failed at boot | with the engine stopped: `sudo systemctl restart dsv41-mesh`, then preflight |
@@ -103,8 +107,10 @@ which question, and the known failures with their fixes. Work from evidence: run
 - KV pool is pinned (`MAX_TOTAL_TOKENS=4259840`, boot log `max_total_num_tokens=4259840`). If the boot log shows less,
   the node had less free memory at boot (another process, page cache): drop caches and restart. Do not raise
   `MEM_FRACTION_STATIC` above 0.86 or `vm.watermark_scale_factor` (it shrinks what CUDA reports free).
-- Anything else using GPU/RAM on a node (another model, a notebook) will starve the engine: check `nvidia-smi` and
-  `ps -eo rss,args --sort=-rss | head` on each node.
+- Anything else using GPU/RAM on a node (another model, a notebook) will starve the engine: `./dsv41 mem` lists the
+  biggest other processes per node. To use the machines for something else, `./dsv41 unload` first.
+- Disk: logs are rotated (`/etc/logrotate.d/dsv41`, hourly, 200 MB x 3 per log: container logs and the engine log),
+  the black box keeps 7 days. `./dsv41 status` flags a node under 50 GB free.
 
 ## 6. Prefix cache: "why was my prompt not cached?"
 
@@ -137,7 +143,11 @@ which question, and the known failures with their fixes. Work from evidence: run
   `input_schema`. JSON output: `response_format` `json_schema` / `json_object`.
 - Sampling kwargs accepted: temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty, frequency_penalty, stop,
   n, logprobs/top_logprobs. `seed` with temperature > 0 is not reproducible under DSpark (greedy is deterministic).
-- API key: `API_KEY` in `cluster.env` -> `./install.sh engine && ./dsv41 restart`; clients send `Authorization: Bearer <key>`.
+- API key: `./dsv41 key <key>` (writes `cluster.env`, regenerates the profile, restarts). Clients send
+  `Authorization: Bearer <key>`; SGLang does not read `x-api-key`. Without the key: 401 on every API route; `/health` and
+  `/metrics` stay open. The guard, `dsv41`, tests and examples read the key from `engine/.env.tp4` / `DSV41_API_KEY`.
+- Video: no video input; `examples/video.py` cuts frames with ffmpeg and sends them as images (32 per request tested).
+- Odd images (4K, panorama, 8x8, alpha, WebP) work; corrupt data is a clean 400 (`tests/multimodal_edge.py`).
 - Speed is reported per request by tokens: measure tok/s as `usage.completion_tokens / elapsed`, never by counting stream
   chunks (one DSpark step carries several tokens).
 

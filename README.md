@@ -85,18 +85,25 @@ It asks for the four LAN addresses (this Spark first), then:
 ## Use
 
 ```bash
-./dsv41 status         # engine, KV pool, nodes, free memory, endpoint URLs
-./dsv41 url            # endpoint + a curl example
-./dsv41 test           # API suite: 42 checks
-./dsv41 logs           # head log (./dsv41 logs rk3 200 for a worker)
-./dsv41 stop | start | restart | preflight | bench | validate
+./dsv41 status         # engine, KV pool, nodes, free memory and disk, endpoint URLs
+./dsv41 start | stop | restart
+./dsv41 unload | load  # free the Sparks' memory and keep it off across reboots / bring it back
+./dsv41 enable | disable           # start at boot on / off
+./dsv41 reboot rk3     # (or all) stop, reboot, wait, start again
+./dsv41 key mysecret   # set the API key (./dsv41 key off removes it, ./dsv41 key shows whether one is set)
+./dsv41 logs | mem | disk | preflight | harden | diag
+./dsv41 test | bench | validate    # API suite (42 checks) / quick bench / full proof
 python3 examples/client.py --url http://<head>:8888 --image some.png   # thinking, stream, tools, JSON, vision, long documents
+python3 examples/video.py clip.mp4 "What happens?"                     # video: frames cut with ffmpeg, sent as images
 bash examples/curl.sh
 ```
 - Endpoint `http://<head LAN address>:8888/v1` (the head listens on every interface) or `http://10.10.100.1:8888/v1` on
   the ring; model `DeepSeek-V4.1-Flash-1017-UNCENSORED`. Any OpenAI- or Anthropic-compatible client works.
-- Before exposing the port beyond your LAN, set `API_KEY` in `cluster.env`, then `./install.sh engine && ./dsv41 restart`.
-  Clients send `Authorization: Bearer <key>` (Anthropic SDKs: use `auth_token` / `ANTHROPIC_AUTH_TOKEN`, not `x-api-key`).
+- Before exposing the port beyond your LAN: `./dsv41 key <key>`. Clients then send `Authorization: Bearer <key>` (Anthropic
+  SDKs: use `auth_token` / `ANTHROPIC_AUTH_TOKEN`, not `x-api-key`); without it every API route answers 401. `/health` and
+  `/metrics` stay open for monitoring.
+- Images: PNG, JPEG, WebP, from 8x8 up to 4K and panoramas, up to 32 per request (tests/multimodal_edge.py). Video: the
+  model reads images, so `examples/video.py` samples N frames (default 8, 768 px) with their timestamps.
 - Thinking: `"chat_template_kwargs":{"thinking":true}` + `"reasoning_effort":"low|high|max"` on chat;
   `"reasoning":{"effort":...}` on `/v1/responses`; `"thinking":{"type":"enabled","budget_tokens":>=1024}` on `/v1/messages`.
   Always send `max_tokens`.
@@ -128,8 +135,8 @@ docs/RESULTS.md                    measurements           docs/COMPARISON.md   a
 config/env.tp4                     the serving profile    config/*.txt         shard split, kernel packages, HF SHA256s
 fabric/                            ring addressing, node IPs, route persistence, cable mapper + checker, ssh config
 patches/                           engine patch, NCCL #2393 fence, flatten-base Dockerfile
-scripts/                           ring-preflight, node-hardening, black box, guard service, drop-caches, weight download
-bench/  tests/  examples/          benchmarks · validate.sh, soaks, api_suite, mem_abort · client.py, curl.sh
+scripts/                           ring-preflight, fabric-heal, node-hardening, black box, guard service, drop-caches, weights
+bench/  tests/  examples/          benchmarks · validate.sh, soaks, api_suite, multimodal_edge, mem_abort · client.py, video.py, curl.sh
 ```
 
 ## Contact

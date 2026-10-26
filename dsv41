@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # dsv41 — day-to-day control of the 4x Spark TP4 endpoint (run on the head, from this repository).
 #
-#   ./dsv41 start            start (via the guard service: preflight, cache drop + compaction, boot, watchdog)
-#   ./dsv41 stop             stop the guard and the engine on all four nodes
-#   ./dsv41 restart
-#   ./dsv41 status           guard, engine, KV pool, nodes, MemAvailable per node, endpoint URLs
-#   ./dsv41 logs [rkN] [n]   engine log (head by default), last n lines
-#   ./dsv41 preflight [--bw] check every node (kernel, links, RoCE GIDs, mesh, NCCL, image, weights, hardening)
-#   ./dsv41 test             API suite (chat, responses, messages, tools, images, thinking, kwargs, DSpark) from rk3
-#   ./dsv41 bench            quick decode (code c1/c4/c8) + cold prefill (32k / 128k) from rk3
-#   ./dsv41 validate         the full proof: 5 x 1M LRU, 30-min long-prefix soak, 30-min mixed soak (~1 h 50 min)
-#   ./dsv41 url              endpoint URLs and a curl example
+#   ./dsv41 status            guard, engine, KV pool, nodes, free memory and disk per node, endpoint URLs
+#   ./dsv41 start | stop | restart     start via the guard (preflight, cache drop + compaction, boot, watchdog) / stop
+#   ./dsv41 unload | load     stop and do not start at boot (frees ~100 GiB per node) / start and start at boot again
+#   ./dsv41 enable | disable  start at boot on / off (does not start or stop now)
+#   ./dsv41 reboot rkN|all    stop the engine, reboot node(s), wait until they are back, start again
+#   ./dsv41 key [KEY|off]     show / set / remove the API key (rewrites the profile, restarts the engine)
+#   ./dsv41 logs [rkN] [n]    engine log (head by default), last n lines
+#   ./dsv41 mem | disk        per node: free memory + biggest other processes / free disk, logs, images
+#   ./dsv41 preflight [--bw]  check every node (kernel, links, RoCE GIDs, mesh, NCCL, image, weights, hardening)
+#   ./dsv41 harden            (re)apply node hardening on all four nodes (safe while running)
+#   ./dsv41 test | bench      API suite (42 checks) + multimodal edge cases / quick decode + prefill bench, from rk3
+#   ./dsv41 validate          the full proof: 5 x 1M LRU, 30-min long-prefix soak, 30-min mixed soak (~1 h 50 min)
+#   ./dsv41 diag              collect a support bundle (logs, preflight, black boxes) into logs/diag-*.tar.gz
+#   ./dsv41 url               endpoint URLs and a curl example
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$HERE/cluster.env" ]] || { echo "no cluster.env: run ./install.sh first (see README)" >&2; exit 1; }
@@ -27,11 +31,60 @@ E=${AK:+DSV41_API_KEY=$AK }
 case "${1:-status}" in
   start)
     if has_guard; then sudo systemctl start dsv41-guard; echo "guard started; boot takes ~3-4 min: ./dsv41 status"
-    else "$HERE/scripts/ring-preflight.sh" && "$HERE/scripts/drop-caches.sh" && (cd "$ENG" && ./start-tp4.sh serve); fi ;;
+    else "$HERE/scripts/fabric-heal.sh"; "$HERE/scripts/ring-preflight.sh" && "$HERE/scripts/drop-caches.sh" && (cd "$ENG" && ./start-tp4.sh serve); fi ;;
   stop)
     has_guard && sudo systemctl stop dsv41-guard
     (cd "$ENG" && ./start-tp4.sh stop) ;;
   restart) "$0" stop; "$0" start ;;
+  unload) "$0" stop; has_guard && sudo systemctl disable -q dsv41-guard; echo "engine unloaded; it will not start at boot until ./dsv41 load" ;;
+  load) has_guard && sudo systemctl enable -q dsv41-guard; "$0" start ;;
+  enable) sudo systemctl enable -q dsv41-guard && echo "starts at boot" ;;
+  disable) sudo systemctl disable -q dsv41-guard && echo "does not start at boot" ;;
+  reboot)
+    t=${2:?usage: ./dsv41 reboot rk1|rk2|rk3|rk4|all}; [[ $t == all ]] && t="rk2 rk3 rk4 rk1"
+    "$0" stop
+    declare -A BID
+    for n in $t; do
+      if [[ $n == rk1 ]]; then echo "rebooting the head; the guard starts the engine when it is back (if enabled)"; sudo systemctl reboot; exit 0; fi
+      BID[$n]=$(ssh -n -o BatchMode=yes "$n" cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+      ssh -n -o BatchMode=yes "$n" 'sudo systemctl reboot' 2>/dev/null; echo "rebooting $n"
+    done
+    for n in $t; do   # back = answers with a NEW boot id (not merely still answering while it shuts down)
+      for i in $(seq 90); do
+        b=$(ssh -n -o BatchMode=yes -o ConnectTimeout=4 "$n" cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+        [[ -n "$b" && "$b" != "${BID[$n]}" ]] && break; sleep 10
+      done
+      [[ -n "$b" && "$b" != "${BID[$n]}" ]] && echo "$n is back" || { echo "$n did not come back within 15 min: power-cycle it" >&2; exit 1; }
+    done
+    "$0" start ;;
+  key)
+    case "${2:-}" in
+      "") [[ -n "$AK" ]] && echo "API key set (${#AK} characters): clients send 'Authorization: Bearer <key>'" || echo "no API key: the endpoint is open to anyone who can reach port $PORT" ;;
+      *) v=$2; [[ $v == off ]] && v=""
+         [[ "$v" =~ ^[A-Za-z0-9._~+/=-]*$ ]] || { echo "key may only contain letters, digits and ._~+/=-" >&2; exit 1; }
+         grep -q "^API_KEY=" "$HERE/cluster.env" && sed -i "s|^API_KEY=.*|API_KEY=$v|" "$HERE/cluster.env" || echo "API_KEY=$v" >> "$HERE/cluster.env"
+         "$0" stop; "$HERE/install.sh" engine >/dev/null; "$0" start
+         [[ -n "$v" ]] && echo "API key set; restarting (~3-4 min)" || echo "API key removed; restarting (~3-4 min)" ;;
+    esac ;;
+  mem)
+    for k in 1 2 3 4; do
+      ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k 'echo "rk'$k' $(hostname): MemAvailable $(awk "/MemAvailable/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB, swap free $(awk "/SwapFree/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB"
+        ps -eo rss,comm --sort=-rss | awk "NR>1 && \$2 !~ /^sglang|python3|boot.py/ {printf \"    %6.1f GiB  %s\n\", \$1/1048576, \$2; if (++n==3) exit}"' 2>/dev/null || echo "rk$k UNREACHABLE"
+    done ;;
+  disk)
+    for k in 1 2 3 4; do
+      ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k "echo \"rk$k \$(hostname): / free \$(df -h --output=avail / | tail -1 | tr -d ' '), model dir free \$(df -h --output=avail \$(dirname $MODEL_DIR) 2>/dev/null | tail -1 | tr -d ' '), journal \$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1), black box \$(sudo du -sh /var/log/dsv41-blackbox 2>/dev/null | cut -f1), images \$(docker images -q | wc -l)\"
+        f=\$(df -BG --output=avail / | tail -1 | tr -dc 0-9); [ \"\$f\" -lt 50 ] && echo '    WARNING: under 50 GB free on /'; true" 2>/dev/null || echo "rk$k UNREACHABLE"
+    done ;;
+  harden) "$HERE/install.sh" hardening ;;
+  diag)
+    d=$HERE/logs/diag-$(date +%Y%m%d-%H%M%S); mkdir -p "$d"
+    "$0" status > "$d/status.txt" 2>&1; "$HERE/scripts/ring-preflight.sh" > "$d/preflight.txt" 2>&1
+    "$0" mem > "$d/mem.txt" 2>&1; "$0" disk > "$d/disk.txt" 2>&1
+    cp "$(ls -t "$ENG"/logs-tp4/*.log | head -1)" "$d/head.log" 2>/dev/null; cp "$HERE/logs/guard/guard.log" "$d/" 2>/dev/null
+    for k in 2 3 4; do ssh rk$k 'docker logs --tail 500 dsv41-worker 2>&1' > "$d/rk$k-worker.log" 2>&1; done
+    for k in 1 2 3 4; do ssh rk$k 'sudo dmesg -T | tail -100; echo "-- black box, last 10 min"; sudo tail -600 /var/log/dsv41-blackbox/$(date +%Y%m%d).log' > "$d/rk$k-system.txt" 2>&1; done
+    tar -C "$(dirname "$d")" -czf "$d.tar.gz" "$(basename "$d")" && rm -rf "$d" && echo "$d.tar.gz (no keys or tokens inside; check before sharing)" ;;
   status)
     echo "guard:  $(systemctl is-active dsv41-guard 2>/dev/null)   $(tail -1 "$HERE/logs/guard/guard.log" 2>/dev/null)"
     if curl -fsS -m 10 "${AUTH[@]}" "$API/v1/loads" >/dev/null 2>&1; then
@@ -40,13 +93,19 @@ case "${1:-status}" in
     L=$(ls -t "$ENG"/logs-tp4/*.log 2>/dev/null | head -1)
     [[ -n "$L" ]] && echo "KV pool: $(grep -m1 -oE 'max_total_num_tokens=[0-9]+' "$L")"
     for k in 1 2 3 4; do
-      ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k 'echo "rk'$k' $(hostname)  MemAvailable $(awk "/MemAvailable/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB  up $(uptime -p | cut -c4-)"' 2>/dev/null || echo "rk$k UNREACHABLE"
+      ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k 'f=$(df -BG --output=avail / | tail -1 | tr -dc 0-9); echo "rk'$k' $(hostname)  MemAvailable $(awk "/MemAvailable/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB  disk free ${f} GB$([ "$f" -lt 50 ] && echo " (LOW)")  up $(uptime -p | cut -c4-)"' 2>/dev/null || echo "rk$k UNREACHABLE"
     done
     "$0" url ;;
   logs)
     if [[ "${2:-}" == rk[2-4] ]]; then ssh "$2" "docker logs --tail ${3:-100} dsv41-worker 2>&1"; else tail -n "${2:-100}" "$(ls -t "$ENG"/logs-tp4/*.log | head -1)"; fi ;;
   preflight) shift; "$HERE/scripts/ring-preflight.sh" "$@" ;;
-  test) to_rk3 "$HERE/tests/api_suite.py" && ssh rk3 "python3 /tmp/dsv41-tests/api_suite.py --url $API --model $SERVED_MODEL_NAME ${AK:+--api-key $AK}" ;;
+  test)
+    to_rk3 "$HERE/tests/api_suite.py" "$HERE/tests/multimodal_edge.py" || exit 1
+    ssh rk3 "python3 /tmp/dsv41-tests/api_suite.py --url $API --model $SERVED_MODEL_NAME ${AK:+--api-key $AK}"; rc=$?
+    if ssh -n rk3 'command -v ffmpeg >/dev/null'; then
+      echo; ssh rk3 "python3 /tmp/dsv41-tests/multimodal_edge.py --url $API --model $SERVED_MODEL_NAME ${AK:+--api-key $AK}" || rc=1
+    else echo "(multimodal edge cases skipped: no ffmpeg on rk3)"; fi
+    exit $rc ;;
   bench)
     to_rk3 "$HERE/bench/bench.py" && ssh rk3 "cd /tmp/dsv41-tests && ${E}DSV41_URL=$API python3 bench.py decode --conc 1,4,8 --kind code --reps 1 && ${E}DSV41_URL=$API python3 bench.py prefill --lens 32000,128000" ;;
   validate) "$HERE/tests/validate.sh" ;;
@@ -55,5 +114,5 @@ case "${1:-status}" in
     echo "endpoint: http://$lan:$PORT/v1 (LAN)  ·  $API/v1 (ring)   model: $SERVED_MODEL_NAME${AK:+   (API key required)}"
     echo "  curl http://$lan:$PORT/v1/chat/completions -H 'Content-Type: application/json'${AK:+ -H 'Authorization: Bearer \$API_KEY'} \\"
     echo "    -d '{\"model\":\"$SERVED_MODEL_NAME\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'" ;;
-  *) sed -n '2,13p' "$0"; exit 1 ;;
+  *) sed -n '2,19p' "$0"; exit 1 ;;
 esac

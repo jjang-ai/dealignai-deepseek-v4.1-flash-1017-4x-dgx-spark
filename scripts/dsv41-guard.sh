@@ -30,6 +30,7 @@ wait_nodes(){
   while miss=$(for k in 1 2 3 4; do ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k true 2>/dev/null || printf 'rk%s ' $k; done); [ -n "$miss" ]; do
     log "waiting for nodes: ${miss}(a crashed node reboots itself in ~2-3 min: node-hardening.sh; if it stays dark, power-cycle it)"
     sleep 20; done
+  "$HERE/scripts/fabric-heal.sh" 2>&1 | while read -r l; do log "fabric-heal: $l"; done   # GIDs/mesh after a neighbour reboot
   until "$HERE/scripts/ring-preflight.sh" > "$G/preflight.last" 2>&1; do
     log "preflight FAIL: $(grep -F '[x]' "$G/preflight.last" | head -3 | tr '\n' ' ')"; sleep 30; done
   log "preflight PASS"

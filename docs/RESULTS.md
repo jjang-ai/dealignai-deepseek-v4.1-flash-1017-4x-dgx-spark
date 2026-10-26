@@ -37,6 +37,19 @@ failures 200/200, lowest MemAvailable 2.77 GiB.
 | code | 83.4 | 120.5 (61.0) | 170.5 (45.5) | 230.8 (32.0) |
 | prose | 57.0 | 78.9 (40.0) | 112.6 (28.7) | 157.9 (20.5) |
 
+## Edge cases (with an API key set, on the packaged deployment)
+
+| case | result |
+|---|---|
+| 5 concurrent ~900k prompts = 4.49M tokens, more than the 4.26M KV pool | 5/5 needles; the scheduler queues what does not fit; 5,069 tok/s aggregate; lowest MemAvailable 4.6 GiB |
+| 24 concurrent chats (3x the 8 slots) | 24/24 answered, 3.9 s wall |
+| 5 x 1M LRU with the key | PASS: revisits 2.6-3.1 s at 100 %, the oldest session evicted |
+| images: 4K, 4000x300 panorama, 8x8, alpha PNG, JPEG, WebP, 32 in one request | 9/9 (tests/multimodal_edge.py); corrupt or non-image data is a clean 400, engine unaffected |
+| video (`examples/video.py`, 8 frames of a 4-colour clip) | "red, green, blue, yellow" (1,893 prompt tokens) |
+| API key | no key / wrong key: 401 on chat, models, loads; correct key: 200; `/health`, `/metrics` open |
+| `./dsv41 reboot rk4` | stop -> reboot -> fabric-heal restarted the node's mesh -> preflight PASS -> Ready in 4 min 17 s, no manual step |
+| `./dsv41 unload` / `load` | all containers gone, 110-111 GiB free per node, autostart off / on, Ready in ~3 min, API 42/42 |
+
 ## Decode on the upstream harnesses (docs/COMPARISON.md)
 
 | harness | result here | published upstream |
