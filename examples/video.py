@@ -38,7 +38,7 @@ content.append({"type": "text", "text": A.question})
 
 body = {"model": A.model, "max_tokens": A.max_tokens, "temperature": 0, "messages": [{"role": "user", "content": content}],
         "chat_template_kwargs": {"thinking": False}}
-h = {"Content-Type": "application/json"}
+h = {"Content-Type": "application/json", "User-Agent": "dsv41-client/1.0"}   # Python-urllib is blocked by Cloudflare BIC
 if A.api_key:
     h["Authorization"] = "Bearer " + A.api_key
 req = urllib.request.Request(A.url + "/v1/chat/completions", json.dumps(body).encode(), h)

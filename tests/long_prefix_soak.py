@@ -22,7 +22,7 @@ import time
 import urllib.request
 
 BASE = os.environ.get("DSV41_URL", "http://10.10.100.1:8888")
-HEADERS = {"Content-Type": "application/json"}
+HEADERS = {"Content-Type": "application/json", "User-Agent": "dsv41-tests/1.0"}
 if os.environ.get("DSV41_API_KEY"):
     HEADERS["Authorization"] = "Bearer " + os.environ["DSV41_API_KEY"]
 MODEL = "DeepSeek-V4.1-Flash-1017-UNCENSORED"
@@ -38,7 +38,7 @@ def post(path, body, timeout):
 
 def healthy():
     try:
-        with urllib.request.urlopen(BASE + "/health", timeout=30) as r:
+        with urllib.request.urlopen(urllib.request.Request(BASE + "/health", headers=HEADERS), timeout=30) as r:
             return r.status == 200
     except Exception:  # noqa: BLE001
         return False

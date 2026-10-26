@@ -146,6 +146,16 @@ which question, and the known failures with their fixes. Work from evidence: run
 - API key: `./dsv41 key <key>` (writes `cluster.env`, regenerates the profile, restarts). Clients send
   `Authorization: Bearer <key>`; SGLang does not read `x-api-key`. Without the key: 401 on every API route; `/health` and
   `/metrics` stay open. The guard, `dsv41`, tests and examples read the key from `engine/.env.tp4` / `DSV41_API_KEY`.
+- Model ids: the served name plus `DSV41_MODEL_ALIASES` (`DeepSeek-V4.1-Flash-1017`, `DeepSeek-V4.1-Flash`, `DeepSeek`,
+  `deepseek`); boot log `DSV41 model aliases: ... (2 routes)`.
+- Behind Cloudflare Tunnel: point the tunnel at the edge proxy (`./dsv41 edge start`, `http://localhost:8890`).
+  | symptom | cause | fix |
+  |---|---|---|
+  | `524` after ~100-125 s on a long prompt or long non-streamed answer | proxy first-byte timeout; the engine sends nothing until the prefill/answer is done | route through the edge proxy |
+  | `403` `error code: 1010` | Browser Integrity Check blocks the client's user agent (`Python-urllib`) | send a normal `User-Agent` (SDKs do), or disable BIC for the API host |
+  | an HTML challenge page instead of JSON | security level / bot protection challenged the client's IP | lower the security level or skip it for the API hostname (a Cloudflare configuration rule) |
+  | `413` | request body over the plan limit (100 MB on Free) | fewer/smaller images |
+  | streams arrive in bursts | a buffering proxy in between; Cloudflare itself streams SSE unbuffered | check other proxies; `response_buffering` must be off |
 - Video: no video input; `examples/video.py` cuts frames with ffmpeg and sends them as images (32 per request tested).
 - Odd images (4K, panorama, 8x8, alpha, WebP) work; corrupt data is a clean 400 (`tests/multimodal_edge.py`).
 - Speed is reported per request by tokens: measure tok/s as `usage.completion_tokens / elapsed`, never by counting stream

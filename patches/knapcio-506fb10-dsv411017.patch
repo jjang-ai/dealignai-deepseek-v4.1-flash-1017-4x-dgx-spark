@@ -36,6 +36,69 @@ index 18e63af..ffb8fa2 100644
  # The per-chunk indexer buffer is CHUNKED_PREFILL_SIZE x prefix x 4 B per ratio-1 source
  # layer, ~14 B x chunk x prefix at the peak across layers: at 1M context a 1024-token
  # chunk peaks around 15 GB, against the ~24 GiB per rank that MEM_FRACTION_STATIC=0.80
+diff --git a/adapter/model_aliases.py b/adapter/model_aliases.py
+new file mode 100644
+index 0000000..b30be03
+--- /dev/null
++++ b/adapter/model_aliases.py
+@@ -0,0 +1,57 @@
++"""Extra model ids for the served model (DSV41_MODEL_ALIASES=name1,name2,...).
++
++Chat completions and Anthropic messages already accept any `model` value. The Responses API rejects ids other
++than the served name with 404, and `/v1/models` lists only the served name, so clients that pick a model from the
++list or validate it (and Responses clients) cannot use a shorter id. With aliases set:
++- `/v1/responses` accepts every alias;
++- `/v1/models` lists each alias as its own model card (root = the served model);
++- `/v1/models/<alias>` resolves.
++Responses still report the id the client sent. Nothing else changes.
++"""
++import logging
++import os
++
++logger = logging.getLogger(__name__)
++ALIASES = [a.strip() for a in os.environ.get("DSV41_MODEL_ALIASES", "").split(",") if a.strip()]
++
++
++def install_responses(module):
++    cls = getattr(module, "OpenAIServingResponses", None)
++    if cls is None or getattr(cls, "_dsv41_aliases", False):
++        return
++    orig = cls._known_model_names
++
++    def _known_model_names(self):
++        return orig(self) | set(ALIASES)
++
++    cls._known_model_names = _known_model_names
++    cls._dsv41_aliases = True
++
++
++def install_http(module):
++    from fastapi.routing import APIRoute
++
++    orig_list, orig_get = module.available_models, module.retrieve_model
++
++    async def available_models():
++        out = await orig_list()
++        base = out.data[0]
++        for a in ALIASES:
++            if all(c.id != a for c in out.data):
++                out.data.append(base.model_copy(update={"id": a, "root": base.id}))
++        return out
++
++    async def retrieve_model(model: str):
++        if model in ALIASES:
++            out = await orig_get(module._global_state.tokenizer_manager.served_model_name)
++            return out.model_copy(update={"id": model}) if hasattr(out, "model_copy") else out
++        return await orig_get(model)
++
++    swap = {"/v1/models": available_models, "/v1/models/{model:path}": retrieve_model}
++    n = 0
++    for r in module.app.router.routes:
++        if isinstance(r, APIRoute) and r.path in swap and "GET" in r.methods:
++            # keep the route and its (SGLang custom) handler; only the function it calls changes, same signature
++            r.endpoint = r.dependant.call = swap[r.path]
++            n += 1
++    logger.warning("DSV41 model aliases: %s (%d routes)", ", ".join(ALIASES), n)
 diff --git a/adapter/prefill_empty_cache.py b/adapter/prefill_empty_cache.py
 index c8f8b8c..715abbc 100644
 --- a/adapter/prefill_empty_cache.py
@@ -226,10 +289,25 @@ index c8f8b8c..715abbc 100644
 +    logger.warning('DSV41 prefill trim hook installed (long prefill >= %d tokens; trim above working set + '
 +                   '%.2f GiB cached-free, every >= %.0f s)', threshold, _TRIM / _GIB, _TRIM_EVERY_S)
 diff --git a/adapter/sitecustomize.py b/adapter/sitecustomize.py
-index 851ffcd..833cdce 100644
+index 851ffcd..84346ac 100644
 --- a/adapter/sitecustomize.py
 +++ b/adapter/sitecustomize.py
-@@ -259,6 +259,21 @@ class EngramLoader(importlib.abc.Loader):
+@@ -247,6 +247,14 @@ class EngramLoader(importlib.abc.Loader):
+             if os.environ.get('DSV41_CERT_HEAD', '0').strip().lower() not in ('0', 'off', 'false', '', 'no'):
+                 from cert_head import install_logits as install_cert_head_logits
+                 install_cert_head_logits(module)
++        elif module.__name__ == 'sglang.srt.entrypoints.openai.serving_responses':
++            if os.environ.get('DSV41_MODEL_ALIASES', '').strip():   # extra model ids (adapter/model_aliases.py)
++                from model_aliases import install_responses
++                install_responses(module)
++        elif module.__name__ == 'sglang.srt.entrypoints.http_server':
++            if os.environ.get('DSV41_MODEL_ALIASES', '').strip():
++                from model_aliases import install_http
++                install_http(module)
+         elif module.__name__ == 'sglang.srt.managers.tokenizer_manager':
+             # DSV41_REPLAY_GUARD (default on): a prompt-logprob request gets HTTP 400 instead of
+             # raising inside the forward under decoder SWA bounded replay (all ranks exit).
+@@ -259,6 +267,21 @@ class EngramLoader(importlib.abc.Loader):
          elif module.__name__ == 'sglang.srt.managers.schedule_batch':
              from loop_abort import install as install_loop_abort
              install_loop_abort(module)
@@ -251,7 +329,7 @@ index 851ffcd..833cdce 100644
          else:
              # V4.1 ratio-1/2 indexers always call the FP4 DeepGEMM kernel.
              # SM120 needs its split-128 planner even when the legacy FP8
-@@ -290,6 +305,9 @@ class EngramFinder(importlib.abc.MetaPathFinder):
+@@ -290,8 +313,13 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                              'sglang.srt.speculative.dspark_components.dspark_draft_sampler',
                              'sglang.kernels.ops.speculative.dspark.dspark_accept',
                              'sglang.srt.managers.schedule_batch',
@@ -260,7 +338,11 @@ index 851ffcd..833cdce 100644
 +                            'sglang.srt.mem_cache.unified_radix_cache',
                              'sglang.srt.managers.scheduler',
                              'sglang.srt.managers.tokenizer_manager',
++                            'sglang.srt.entrypoints.openai.serving_responses',
++                            'sglang.srt.entrypoints.http_server',
                              'sglang.kernels.ops.moe.moe_fused_gate',
+                             'sglang.srt.speculative.dspark_components.dspark_draft',
+                             'sglang.srt.speculative.dspark_components.dspark_planner',
 diff --git a/adapter/swa_evict_internal_first.py b/adapter/swa_evict_internal_first.py
 new file mode 100644
 index 0000000..1c0729a

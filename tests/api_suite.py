@@ -6,7 +6,7 @@
 Each check prints PASS/FAIL with a reason; exit code = number of failures.
 Images are generated here (PNG, known content) so vision answers can be graded automatically.
 """
-import argparse, base64, http.server, json, os, socket, struct, sys, threading, time, urllib.request, zlib
+import argparse, base64, http.server, json, os, struct, sys, threading, time, urllib.request, zlib
 
 A = argparse.ArgumentParser()
 A.add_argument("--url", default="http://10.10.100.1:8888")
@@ -16,7 +16,7 @@ A.add_argument("--only", default="")
 A.add_argument("--api-key", default=os.environ.get("DSV41_API_KEY", ""))
 ARGS = A.parse_args()
 URL, MODEL = ARGS.url, ARGS.model
-HEADERS = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+HEADERS = {"Content-Type": "application/json", "anthropic-version": "2023-06-01", "User-Agent": "dsv41-tests/1.0"}
 if ARGS.api_key:
     HEADERS["Authorization"] = "Bearer " + ARGS.api_key
 results = []
@@ -130,10 +130,8 @@ def t_stream():
 def t_disconnect():
     body = {"model": MODEL, "messages": [{"role": "user", "content": "Write 2000 words about rivers."}], "max_tokens": 2000, "stream": True,
             "chat_template_kwargs": {"thinking": False}}
-    s = socket.create_connection((URL.split("//")[1].split(":")[0], int(URL.rsplit(":", 1)[1])))
-    p = json.dumps(body).encode()
-    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(p) + p)
-    s.recv(4096); time.sleep(1.0); s.close()                      # drop mid-stream
+    resp = urllib.request.urlopen(urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), HEADERS), timeout=300)
+    resp.read(512); time.sleep(1.0); resp.close()                 # drop mid-stream (http or https, with the key)
     time.sleep(2)
     st, r = chat([{"role": "user", "content": "Reply with OK."}], max_tokens=5)
     return st == 200 and "ok" in msg(r)["content"].lower(), "engine healthy after client disconnect"

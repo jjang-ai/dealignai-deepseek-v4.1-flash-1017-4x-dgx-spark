@@ -12,7 +12,7 @@ ap.add_argument("--url", default=os.environ.get("DSV41_URL", "http://10.10.100.1
 ap.add_argument("--api-key", default=os.environ.get("DSV41_API_KEY", ""))
 ap.add_argument("--model", default="DeepSeek-V4.1-Flash-1017-UNCENSORED")
 A = ap.parse_args()
-H = {"Content-Type": "application/json", **({"Authorization": "Bearer " + A.api_key} if A.api_key else {})}
+H = {"Content-Type": "application/json", "User-Agent": "dsv41-tests/1.0", **({"Authorization": "Bearer " + A.api_key} if A.api_key else {})}
 TD = tempfile.mkdtemp()
 
 

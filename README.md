@@ -102,6 +102,14 @@ bash examples/curl.sh
 - Before exposing the port beyond your LAN: `./dsv41 key <key>`. Clients then send `Authorization: Bearer <key>` (Anthropic
   SDKs: use `auth_token` / `ANTHROPIC_AUTH_TOKEN`, not `x-api-key`); without it every API route answers 401. `/health` and
   `/metrics` stay open for monitoring.
+- Model ids: `DeepSeek-V4.1-Flash-1017-UNCENSORED`, and the aliases `DeepSeek-V4.1-Flash-1017`, `DeepSeek-V4.1-Flash`,
+  `DeepSeek`, `deepseek` (all listed in `/v1/models`, accepted on every route; `DSV41_MODEL_ALIASES` in config/env.tp4).
+- Public URL through Cloudflare Tunnel (or any proxy that gives up when the first response byte takes > 100 s): run
+  `./dsv41 edge start` and point the tunnel at `http://localhost:8890` instead of 8888. The edge proxy answers slow
+  requests (cold prefills of long prompts, long non-streamed generations) early and keeps them alive, so a cold ~900k-token
+  prompt and 9,000-token generations complete through Cloudflare. Cloudflare's Browser Integrity Check blocks the
+  `Python-urllib` user agent (error 1010): the OpenAI/Anthropic SDKs, curl, requests and httpx pass; set any other
+  `User-Agent` in hand-written urllib clients (the scripts here do). Uploads are capped at 100 MB per request (Free plan).
 - Images: PNG, JPEG, WebP, from 8x8 up to 4K and panoramas, up to 32 per request (tests/multimodal_edge.py). Video: the
   model reads images, so `examples/video.py` samples N frames (default 8, 768 px) with their timestamps.
 - Thinking: `"chat_template_kwargs":{"thinking":true}` + `"reasoning_effort":"low|high|max"` on chat;

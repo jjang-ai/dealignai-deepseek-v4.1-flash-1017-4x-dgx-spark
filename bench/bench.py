@@ -14,7 +14,7 @@ request so nothing comes from the prefix cache unless a test wants it to.
 import argparse, concurrent.futures as cf, json, os, random, statistics, time, urllib.request
 
 URL = os.environ.get("DSV41_URL", "http://10.10.100.1:8888")
-HEADERS = {"Content-Type": "application/json"}
+HEADERS = {"Content-Type": "application/json", "User-Agent": "dsv41-bench/1.0"}
 if os.environ.get("DSV41_API_KEY"):
     HEADERS["Authorization"] = "Bearer " + os.environ["DSV41_API_KEY"]
 MODEL = os.environ.get("DSV41_MODEL", "DeepSeek-V4.1-Flash-1017-UNCENSORED")

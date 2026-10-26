@@ -17,7 +17,7 @@ MODEL = "DeepSeek-V4.1-Flash-1017-UNCENSORED"
 
 
 def post(path, body, stream=False):
-    h = {"Content-Type": "application/json"}
+    h = {"Content-Type": "application/json", "User-Agent": "dsv41-client/1.0"}   # Python-urllib is blocked by Cloudflare BIC
     if A.api_key:
         h["Authorization"] = "Bearer " + A.api_key
     req = urllib.request.Request(A.url + path, json.dumps(body).encode(), h)

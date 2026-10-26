@@ -14,6 +14,7 @@
 #   ./dsv41 test | bench      API suite (42 checks) + multimodal edge cases / quick decode + prefill bench, from rk3
 #   ./dsv41 validate          the full proof: 5 x 1M LRU, 30-min long-prefix soak, 30-min mixed soak (~1 h 50 min)
 #   ./dsv41 diag              collect a support bundle (logs, preflight, black boxes) into logs/diag-*.tar.gz
+#   ./dsv41 edge start|stop   keep-alive proxy on 127.0.0.1:8890 for Cloudflare Tunnel / proxies with a 100 s limit
 #   ./dsv41 url               endpoint URLs and a curl example
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +78,7 @@ case "${1:-status}" in
         f=\$(df -BG --output=avail / | tail -1 | tr -dc 0-9); [ \"\$f\" -lt 50 ] && echo '    WARNING: under 50 GB free on /'; true" 2>/dev/null || echo "rk$k UNREACHABLE"
     done ;;
   harden) "$HERE/install.sh" hardening ;;
+  edge) shift; "$HERE/scripts/dsv41-edge.sh" "${@:-status}" ;;
   diag)
     d=$HERE/logs/diag-$(date +%Y%m%d-%H%M%S); mkdir -p "$d"
     "$0" status > "$d/status.txt" 2>&1; "$HERE/scripts/ring-preflight.sh" > "$d/preflight.txt" 2>&1
@@ -92,6 +94,7 @@ case "${1:-status}" in
     else echo "engine: DOWN (or booting)"; fi
     L=$(ls -t "$ENG"/logs-tp4/*.log 2>/dev/null | head -1)
     [[ -n "$L" ]] && echo "KV pool: $(grep -m1 -oE 'max_total_num_tokens=[0-9]+' "$L")"
+    echo "edge:   $("$HERE/scripts/dsv41-edge.sh" status)"
     for k in 1 2 3 4; do
       ssh -o BatchMode=yes -o ConnectTimeout=4 rk$k 'f=$(df -BG --output=avail / | tail -1 | tr -dc 0-9); echo "rk'$k' $(hostname)  MemAvailable $(awk "/MemAvailable/{printf \"%.1f\", \$2/1048576}" /proc/meminfo) GiB  disk free ${f} GB$([ "$f" -lt 50 ] && echo " (LOW)")  up $(uptime -p | cut -c4-)"' 2>/dev/null || echo "rk$k UNREACHABLE"
     done
@@ -114,5 +117,5 @@ case "${1:-status}" in
     echo "endpoint: http://$lan:$PORT/v1 (LAN)  ·  $API/v1 (ring)   model: $SERVED_MODEL_NAME${AK:+   (API key required)}"
     echo "  curl http://$lan:$PORT/v1/chat/completions -H 'Content-Type: application/json'${AK:+ -H 'Authorization: Bearer \$API_KEY'} \\"
     echo "    -d '{\"model\":\"$SERVED_MODEL_NAME\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'" ;;
-  *) sed -n '2,19p' "$0"; exit 1 ;;
+  *) sed -n '2,20p' "$0"; exit 1 ;;
 esac
