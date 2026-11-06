@@ -31,7 +31,10 @@ E=${AK:+DSV41_API_KEY=$AK }
 
 case "${1:-status}" in
   start)
-    if has_guard; then sudo systemctl start dsv41-guard; echo "guard started; boot takes ~3-4 min: ./dsv41 status"
+    if has_guard; then
+      "$HERE/scripts/fabric-heal.sh" >/dev/null 2>&1
+      p=$("$HERE/scripts/ring-preflight.sh" 2>&1) || { grep -F '[x]' <<<"$p"; echo "WARNING: preflight fails: the guard keeps retrying and will NOT start the engine until the lines above are fixed" >&2; }
+      sudo systemctl start dsv41-guard; echo "guard started; boot takes ~3-4 min: ./dsv41 status"
     else "$HERE/scripts/fabric-heal.sh"; "$HERE/scripts/ring-preflight.sh" && "$HERE/scripts/drop-caches.sh" && (cd "$ENG" && ./start-tp4.sh serve); fi ;;
   stop)
     has_guard && sudo systemctl stop dsv41-guard

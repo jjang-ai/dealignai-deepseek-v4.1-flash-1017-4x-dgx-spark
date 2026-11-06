@@ -71,7 +71,7 @@ On the Spark that will be the head (same user on all four, ~600 GB free disk per
 ./setup.sh
 ```
 It asks for the four LAN addresses (this Spark first), then:
-1. checks every node: passwordless ssh and sudo (prints the exact fix), GB10 GPU and driver, kernel, memory, free disk
+1. checks every node: passwordless ssh and sudo (prints the exact fix), sets up ssh between the nodes, GB10 GPU and driver, kernel, memory, free disk
    for the model, Docker + NVIDIA runtime, required packages (installs missing ones), the four CX7 interfaces, RDMA
    devices, link state and speed, internet and Hugging Face access;
 2. checks the cables and writes the ring order;

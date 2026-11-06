@@ -9,7 +9,7 @@ Host rk4
     HostName 10.10.100.4
 Host rk1 rk2 rk3 rk4
     User @NODE_USER@
-    IdentityFile ~/.ssh/id_ed25519
+    IdentityFile ~/.ssh/dsv41_ring
     Compression no
     Ciphers aes128-gcm@openssh.com
 # --- end spark ring ---

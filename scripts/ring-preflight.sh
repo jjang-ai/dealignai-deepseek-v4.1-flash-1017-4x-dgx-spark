@@ -10,9 +10,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=/dev/null
 source "$HERE/cluster.env"
 MESH=$WORK/ring-mesh
-NCCL_SHA=fa3d6cea317cdc02   # /opt/nccl-switchless-4hca-fence (4hca + NCCL#2393 AArch64 CTS fence)
 IMAGE=$(sed -n 's/^IMAGE=//p' "$HERE/config/env.tp4")
 fail=0
+declare -A NCCL    # sha256 of /opt/nccl-switchless-4hca-fence per node: builds differ per machine, all four must match
 ok(){ printf '  \033[32m[+]\033[0m %s\n' "$*"; }
 bad(){ printf '  \033[31m[x]\033[0m %s\n' "$*"; fail=1; }
 
@@ -43,8 +43,8 @@ EOS
 )
   [[ -z "$out" ]] && { bad "unreachable over the fabric"; continue; }
   kern=$(awk '/^kernel/{print $2}' <<<"$out")
-  [[ $kern == "$KERNEL" ]] && ok "kernel $kern" || bad "kernel $kern, expected $KERNEL (TX-capped kernels: 6.17.0-1014, 7.0.0-1019)"
-  grep -q 'LTR-' <<<"$out" && bad "root port LTR- (CX7 TX will cap at ~12.8 Gb/s)" || ok "root ports LTR+"
+  [[ $kern == "$KERNEL" ]] && ok "kernel $kern" || bad "kernel $kern, expected $KERNEL from cluster.env; all nodes must match (TX-capped kernels: 6.17.0-1014, 7.0.0-1019; docs/FABRIC.md)"
+  [[ $(grep -c 'LTR+' <<<"$out") == 2 ]] && ok "root ports LTR+" || bad "root ports not both LTR+ (LTR- caps CX7 TX at ~12.8 Gb/s): $(grep ^ltr <<<"$out" | tr '\n' ' ')"
   while read -r _ n st mtu ip gid t1 t2 hp; do
     [[ $st == up && $mtu == mtu=9000 && $ip == ip=10.10.* && $gid != gid3=0000:0000 && "$t1 $t2" == "RoCE v2" && $hp == hp=8192 ]] \
       && ok "$n $ip ${gid} RoCEv2 hairpin 8192" || bad "$n $st $mtu $ip $gid $t1 $t2 $hp (gid3=0000:0000: see docs/RUNBOOK.md, lost RoCE GIDs)"
@@ -55,12 +55,16 @@ EOS
   grep -q 'meshroute.*MISSING' <<<"$out" && bad "mesh routes: $(grep meshroute <<<"$out" | tr '\n' ' ')" || ok "mesh /32 routes present"
   [[ $(awk '/^tc_in_hw/{print $2}' <<<"$out") -ge 2 ]] && ok "tc rules in hardware" || bad "tc rules not in hardware"
   grep -q 'markers 2 mesh=active' <<<"$out" && ok "markers 2, dsv41-mesh active" || bad "$(grep ^markers <<<"$out")"
-  grep -q "nccl $NCCL_SHA" <<<"$out" && ok "ring NCCL 4hca" || bad "NCCL lib: $(grep ^nccl <<<"$out")"
+  NCCL[$k]=$(awk '/^nccl/{print $2}' <<<"$out")
+  [[ -n ${NCCL[$k]} ]] && ok "ring NCCL ${NCCL[$k]}" || bad "ring NCCL missing: ./install.sh nccl"
   grep -qx "image $img_ref" <<<"$out" && ok "image $img_ref" || bad "image mismatch: $(grep ^image <<<"$out")"
   e=$(awk '/^engram/{print $2}' <<<"$out"); [[ $e -ge 2 ]] && ok "engram packs: $e" || bad "engram packs: $e"
   grep -q 'shards 48' <<<"$out" && ok "checkpoint 48/48" || bad "$(grep ^shards <<<"$out")"
   grep -q 'busy=0' <<<"$out" && ok "GPU idle ($(awk '/^gpu/{print $2}' <<<"$out"))" || echo "  [i] GPU busy: $(grep ^gpu <<<"$out")"
 done
+
+[[ $(printf '%s\n' "${NCCL[@]}" | sort -u | wc -l) == 1 ]] && ok "ring NCCL is the same build on every node" \
+  || bad "ring NCCL differs between nodes (${NCCL[*]}): ./install.sh nccl"
 
 if [[ "${1:-}" == --bw ]]; then
   echo "== RDMA bandwidth, all 8 links, both directions"

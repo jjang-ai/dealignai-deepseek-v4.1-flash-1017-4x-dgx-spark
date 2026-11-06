@@ -31,6 +31,13 @@ U=$NODE_USER
 
 # ---------------------------------------------------------------- 1. reach every node
 say "1/6  ssh and sudo on every node"
+# the head also connects to itself: no password needed to authorize its own key (and to create one if it has none)
+if [[ $MODE == all ]] && hostname -I | tr ' ' '\n' | grep -qxF "${NODE_LAN[0]}" && ! ssh "${SSHO[@]}" "$U@${NODE_LAN[0]}" true 2>/dev/null; then
+  mkdir -p ~/.ssh; chmod 700 ~/.ssh
+  ls ~/.ssh/id_*.pub >/dev/null 2>&1 || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+  f=~/.ssh/authorized_keys; touch "$f"; chmod 600 "$f"; [[ -z "$(tail -c1 "$f")" ]] || echo >> "$f"
+  cat ~/.ssh/id_*.pub | while read -r k; do grep -qxF "$k" "$f" || echo "$k" >> "$f"; done
+fi
 bad=0
 for ip in "${NODE_LAN[@]}"; do
   if ! ssh "${SSHO[@]}" "$U@$ip" true 2>/dev/null; then
@@ -47,6 +54,11 @@ done
 [[ $(ssh "${SSHO[@]}" "$U@${NODE_LAN[0]}" hostname) == "$(hostname)" ]] \
   || die "the first address in cluster.env (${NODE_LAN[0]}) is not this Spark: run setup.sh on the head, or put this Spark's address first"
 
+# every node must reach every node (weight copy, engine launcher, guard): `all` sets it up, the check modes only test
+meshbad=0
+if [[ $MODE == all ]]; then ./install.sh ssh || die "node-to-node ssh could not be set up (above)"
+else ./install.sh ssh_check || { echo "  ${Y}fix: ./install.sh ssh${N} (or run ./setup.sh)"; meshbad=1; }; fi
+
 # ---------------------------------------------------------------- 2. node checks
 say "2/6  hardware, software, disk and links on every node"
 read -r -d '' PROBE <<'EOS'
@@ -54,7 +66,7 @@ ok(){ echo "OK   $*"; }; warn(){ echo "WARN $*"; }; fail(){ echo "FAIL $*"; }
 [ "$(uname -m)" = aarch64 ] && ok "arch aarch64" || fail "arch $(uname -m): this package is for DGX Spark (aarch64)"
 g=$(nvidia-smi -L 2>/dev/null | head -1)
 case "$g" in *GB10*) ok "GPU $g";; "") fail "nvidia-smi does not work: the NVIDIA driver is not loaded";; *) fail "GPU '$g' is not a GB10";; esac
-k=$(uname -r); [ "$k" = "$KERNEL" ] && ok "kernel $k" || warn "kernel $k (not $KERNEL): ./setup.sh installs $KERNEL and asks for one reboot"
+k=$(uname -r); [ "$k" = "$KERNEL" ] && ok "kernel $k" || warn "kernel $k (not $KERNEL): ./setup.sh installs $KERNEL and asks for one reboot; to keep this kernel instead see docs/FABRIC.md"
 m=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo); [ "$m" -ge 115 ] && ok "memory ${m} GiB" || fail "memory ${m} GiB: a Spark has ~121 GiB"
 need(){ d=$1; while [ ! -d "$d" ]; do d=$(dirname "$d"); done; df -BG --output=avail "$d" | tail -1 | tr -dc 0-9; }
 have=$(ls "$MODEL_DIR"/model-*-of-00048.safetensors 2>/dev/null | wc -l)
@@ -86,7 +98,7 @@ done
 curl -sfI -m 10 https://huggingface.co >/dev/null && ok "internet (huggingface.co)" || warn "no internet: needed for packages, the engine build and the model download"
 EOS
 declare -A HOST
-fails=0; pk=()
+fails=$meshbad; pk=()
 for r in 0 1 2 3; do
   ip=${NODE_LAN[$r]}
   out=$(ssh "${SSHO[@]:1}" "$U@$ip" "KERNEL='$KERNEL' MODEL_DIR='$MODEL_DIR' ENGRAM_DIR='$ENGRAM_DIR' bash -s" <<<"$PROBE" 2>&1)   # no -n: the probe comes on stdin
@@ -142,6 +154,8 @@ fi
 
 # ---------------------------------------------------------------- 5. start
 say "5/6  start the engine"
+scripts/fabric-heal.sh
+scripts/ring-preflight.sh > /tmp/dsv41-preflight.log 2>&1 || { grep -F '[x]' /tmp/dsv41-preflight.log; die "preflight failed, the engine would not start (lines above; AGENTS.md lists the fix for each)"; }
 ./dsv41 start
 AK=$(sed -n 's/^API_KEY=//p' engine/.env.tp4 | tr -d '"'); AUTH=(); [[ -n "$AK" ]] && AUTH=(-H "Authorization: Bearer $AK")
 for i in $(seq 90); do curl -fsS -m 5 "${AUTH[@]}" "http://10.10.100.1:$PORT/v1/loads" >/dev/null 2>&1 && break; sleep 10; done

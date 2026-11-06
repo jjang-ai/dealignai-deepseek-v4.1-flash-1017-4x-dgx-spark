@@ -48,6 +48,22 @@ Fix: `6.17.0-1032-nvidia` + `linux-modules-nvidia-580-open-6.17.0-1032-nvidia` (
 (1018 + driver 580.159.03 also has LTR+ but lost ranks under the fast load's memory squeeze, docs/RUNBOOK.md).
 `scripts/ring-preflight.sh` checks the kernel and LTR on every node.
 
+**Other kernels.** 6.17.0-1032 is the kernel everything in docs/RESULTS.md was measured on, not the only one that can work.
+LTR is what matters, and newer kernels may have it: @ivanfioravanti reports 7.0.0-1024-nvidia with driver 580.178.04 as
+`LTR+`, 111.6 Gb/s each way with `ib_write_bw` on one link, decode 83.3 / 167 / 225 tok/s at c1 / c4 / c8 and cold prefill
+5.5-5.8k tok/s (issue #1; not validated by us). To use another kernel, on all four nodes: install it with its
+`linux-modules-nvidia-580-open-<kernel>` package and boot it (keep 1032 in GRUB as a fallback), set `KERNEL=` in
+`cluster.env`, then run `./dsv41 preflight --bw`: every link must read > 100 Gb/s both ways. Then a long prefill
+(`./dsv41 validate`), because the ranks that vanished on 1018 + driver 580.159.03 did so only under load.
+
+Before moving to 7.0, read the NVIDIA forum: an NVIDIA advisory says to hold off on 7.0.0-1019 for multi-node NCCL/RoCE
+(`ibv_reg_mr` ENOMEM; [thread](https://forums.developer.nvidia.com/t/dgx-spark-regression-kernel-7-0-0-1019-nvidia-causes-nccl-roce-ibv-reg-mr-iova2-enomem-6-17-0-1032-works/383023)),
+and users report GPU lockups and hard resets on 7.0.0-1024
+([thread](https://forums.developer.nvidia.com/t/dgx-spark-gpu-lockup-xid-13-fecs-ucode-fatal-xid-154-reset-required-and-kernel-oops-hard-resets-on-kernel-7-0-0-1024-nvidia-stable-on-7-0-0-1/387833)).
+The Ubuntu changelogs up to 7.0.0-1025 name no CX7 throughput or root-port LTR fix. A TX cap on a kernel that shows `LTR+`
+is a different failure: forum users report ~13 Gb/s states after hot-plugging a cable that clear after a reboot with the
+final cabling connected, or a full power-down.
+
 Measured after the fix (`ib_write_bw`, 1 MiB, 4 QPs): all 16 directions 111.84-111.86 Gb/s. cable0 negotiates 2x100G lanes
 (the others 4x50G) and logs corrected PHY bits but carries line rate; reseat it if errors grow.
 
@@ -56,8 +72,9 @@ Measured after the fix (`ib_write_bw`, 1 MiB, 4 QPs): all 16 directions 111.84-1
 NCCL 2.30.7 + alexellis/switchless-nccl v0.0.1 (skip tree/PAT, listener GIDs, hardening) + ondigo-winder
 `nccl-2.30.7-switchless-4hca.patch` (four listener GIDs → all four RDMA functions; all-reduce 105 → 186 Gb/s), built with
 the ondigo `scripts/build.sh` (all four source-tree hashes verified), plus the NCCL#2393 AArch64 CTS-ordering fence
-(`patches/nccl-2393-aarch64-cts-fence.patch`), installed at `/opt/nccl-switchless-4hca-fence` (`libnccl.so.2.30.7` sha256
-`fa3d6cea…`) on every node by `install.sh nccl` and bind-mounted over the image's pip NCCL by the launcher.
+(`patches/nccl-2393-aarch64-cts-fence.patch`), installed at `/opt/nccl-switchless-4hca-fence` on every node by
+`install.sh nccl` and bind-mounted over the image's pip NCCL by the launcher. The hash of `libnccl.so.2.30.7` differs from
+one machine's build to another's, so preflight checks that all four nodes have the same build, not a fixed value.
 
 ## RoCEnante opposite-node mesh (sparkring `cx7_hairpin_diagonal` @ f16b5f4)
 

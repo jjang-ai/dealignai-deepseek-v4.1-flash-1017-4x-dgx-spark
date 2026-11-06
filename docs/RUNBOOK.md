@@ -31,7 +31,7 @@ Engine log: `engine/logs-tp4/dsv41.log`. The boot is good when it shows
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ib_write_bw` / iperf3 TX ~12.8 Gb/s, RX fine; root ports `LTR-` | kernel 6.17.0-1014 / 7.0.0-1019 | boot 6.17.0-1032 (docs/FABRIC.md) |
+| `ib_write_bw` / iperf3 TX ~12.8 Gb/s, RX fine; root ports `LTR-` | kernel 6.17.0-1014 / 7.0.0-1019 (any kernel showing `LTR-`) | boot 6.17.0-1032 or another `LTR+` kernel (docs/FABRIC.md) |
 | `RoCE all-reduce connect failed … ibv_modify_qp(RTR): Connection timed out` on ranks next to a rebooted node | NM flushed the mesh /32 routes | `fabric/mesh-routes-to-nm.sh` (done; preflight checks it) |
 | `TP rank 0 could finish the model loading, but there are other ranks that didn't…` and a worker container `Exited (247)` with no traceback | ranks on driver 580.159.03 / kernel 1018 vanished during the fast load's memory squeeze (MemAvailable ~15 GB) | all nodes on 6.17.0-1032 + 580.178.04 |
 | `The memory capacity is unbalanced ... pre_model_load_memory=...` at boot | one node holds a big page cache (after a download/SHA check/rsync); GB10's CUDA free-memory query does not count it as free | `scripts/drop-caches.sh` (the guard and `install.sh verify` run it before every start) |

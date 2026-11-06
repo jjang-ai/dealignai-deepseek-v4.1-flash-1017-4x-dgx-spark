@@ -60,7 +60,7 @@ which question, and the known failures with their fixes. Work from evidence: run
 - **"connected by two cables"**: two cables between the same pair; the ring needs each node cabled to two different nodes.
 - Link speed should read `200000` (`/sys/class/net/<if>/speed`). A link that is up but slow in `preflight --bw`:
   reseat or swap that cable; a cable that logs corrected PHY errors but carries line rate is fine.
-- TX ~12.8 Gb/s while RX is fine, and `LTR-` on the root ports: wrong kernel. `./install.sh kernel` (6.17.0-1032), reboot.
+- TX ~12.8 Gb/s while RX is fine, and `LTR-` on the root ports: wrong kernel. `./install.sh kernel` (6.17.0-1032), reboot; another `LTR+` kernel can work too (docs/FABRIC.md).
 
 ## 2. Fabric addressing and RoCE
 
@@ -72,7 +72,9 @@ which question, and the known failures with their fixes. Work from evidence: run
 | `markers` not 2 / `dsv41-mesh` inactive / `tc rules not in hardware` | mesh unit failed at boot | with the engine stopped: `sudo systemctl restart dsv41-mesh`, then preflight |
 | ssh/TCP to the opposite node hangs, ping works | node route without `src=` | `./install.sh fabric` |
 | `ring0` missing or not 3 node routes | ring0 profile not applied | `./install.sh fabric` |
-| `NCCL lib` mismatch | NCCL build missing on a node | `./install.sh nccl` |
+| `ring NCCL missing` or `ring NCCL differs` | NCCL build missing on a node, or nodes with different builds | `./install.sh nccl` (reinstalls the same build on all four) |
+| `no such identity`, `Permission denied` between nodes (`install.sh weights`, `rk*`) | nodes cannot ssh to each other or to themselves (NVIDIA Sync provisioning gives them no keys) | `./install.sh ssh` (per-node ring key, authorized on all four); test: `./install.sh ssh_check` |
+| guard log repeats `preflight FAIL` and the engine never starts | by design: the guard retries until preflight passes (also shown by `./dsv41 start` and `status`) | fix the `[x]` lines in `logs/guard/preflight.last` |
 | `image mismatch` | nodes run different engine images | `./install.sh image` (builds once, loads the same image everywhere) |
 
 ## 3. Engine does not boot

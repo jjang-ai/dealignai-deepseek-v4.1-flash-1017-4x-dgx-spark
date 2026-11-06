@@ -4,7 +4,9 @@
 #
 #   ./install.sh cabling   # check the cables: which port reaches which node, ring order, how to fix (= ./setup.sh cables)
 #   ./install.sh kernel    # put every node on $KERNEL + matching NVIDIA modules (REBOOT REQUIRED after)
-#   ./install.sh fabric    # ring addressing, node IPs (ring0), forwarding, ssh aliases rk1..rk4
+#   ./install.sh ssh       # node-to-node ssh: a ring key on every node, authorized on all four; ssh aliases rk1..rk4
+#   ./install.sh ssh_check # only test node-to-node ssh over the LAN, every node to every node (changes nothing)
+#   ./install.sh fabric    # ring addressing, node IPs (ring0), forwarding, then `ssh`
 #   ./install.sh nccl      # build 4-HCA ring NCCL + NCCL#2393 fence, install on all nodes
 #   ./install.sh weights   # parallel download across all nodes, all-to-all copy over the ring, SHA-256 verify
 #   ./install.sh engram    # pack Engram rows per rank on the head, ship to each node's NVMe
@@ -34,6 +36,7 @@ cmd_kernel(){
   for r in "${ALL[@]}"; do
     k=$(on "$r" uname -r)
     if [[ "$k" == "$KERNEL" ]]; then log "rank $r already on $KERNEL"; continue; fi
+    [[ $KERNEL == 6.17.0-1032-nvidia ]] || die "rank $r runs $k, cluster.env asks for $KERNEL: this step only installs 6.17.0-1032. Install $KERNEL by hand (docs/FABRIC.md)"
     log "rank $r: $k -> installing $KERNEL (+ nvidia-580-open modules, driver to match)"
     scp -q "$HERE/config/kernel-1032-packages.txt" "$NODE_USER@$(lan "$r"):/tmp/pk.txt"
     on "$r" 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades $(cat /tmp/pk.txt) \
@@ -44,17 +47,41 @@ cmd_kernel(){
   [[ $need == 0 ]] || { log "REBOOT the updated nodes, then re-run ./install.sh all"; exit 2; }
 }
 
+# The weight copy (pull.sh), the engine launcher and the guard ssh between nodes and from a node to itself, so every
+# node needs a key the other three accept. Nodes provisioned by NVIDIA Sync have none. Each node gets its own key
+# (~/.ssh/dsv41_ring, no passphrase, never copied to another node); every public key goes in all four authorized_keys.
+cmd_ssh(){
+  local pubs r ip
+  pubs=$(for r in "${ALL[@]}"; do
+    on "$r" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh; [ -f ~/.ssh/dsv41_ring ] || ssh-keygen -q -t ed25519 -N "" -C "dsv41-ring-$(hostname)" -f ~/.ssh/dsv41_ring; cat ~/.ssh/dsv41_ring.pub' </dev/null
+  done)
+  for r in "${ALL[@]}"; do
+    on "$r" 'f=~/.ssh/authorized_keys; touch $f; chmod 600 $f; [ -z "$(tail -c1 $f)" ] || echo >> $f
+      while read -r k; do grep -qxF "$k" $f || echo "$k" >> $f; done' <<<"$pubs"
+    sed "s#@NODE_USER@#$NODE_USER#" "$HERE/fabric/ssh-config-ring.txt" \
+      | on "$r" 'sed -i "/# --- spark ring/,/# --- end spark ring ---/d" ~/.ssh/config 2>/dev/null; cat >> ~/.ssh/config; chmod 600 ~/.ssh/config'
+  done
+  cmd_ssh_check
+}
+
+cmd_ssh_check(){
+  local r ip bad=0
+  for r in "${ALL[@]}"; do for ip in "${NODE_LAN[@]}"; do
+    on "$r" "test -f ~/.ssh/dsv41_ring && ssh -n -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i ~/.ssh/dsv41_ring $NODE_USER@$ip true" </dev/null 2>/dev/null \
+      || { printf '\033[1;31m[install]\033[0m rank %s (%s) cannot ssh to %s with ~/.ssh/dsv41_ring\n' "$r" "$(lan "$r")" "$ip" >&2; bad=1; }
+  done; done
+  [[ $bad == 0 ]] || die "node-to-node ssh failed: run ./install.sh ssh. If it still fails: a changed host key (ssh-keygen -R <address> on that node) or sshd refusing keys"
+  log "node-to-node ssh OK (all 16 pairs, each node to itself included)"
+}
+
 cmd_fabric(){
+  cmd_ssh
   for r in "${ALL[@]}"; do
     scp -q "$HERE/fabric/ring-net.sh" "$HERE/fabric/ring0.sh" "$NODE_USER@$(lan "$r"):/tmp/"
     on "$r" "sudo bash /tmp/ring-net.sh $r && sudo bash /tmp/ring0.sh $r" | sed "s/^/  rank$r: /"
     on "$r" 'for i in enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1; do sudo nmcli con mod ring-$i ipv6.addr-gen-mode eui64 && sudo nmcli con up ring-$i >/dev/null; done'
   done
-  # ssh aliases rk1..rk4 on every node; pin fabric host keys only when they match the LAN key
-  for r in "${ALL[@]}"; do
-    sed "s#@NODE_USER@#$NODE_USER#" "$HERE/fabric/ssh-config-ring.txt" \
-      | on "$r" 'sed -i "/# --- spark ring/,/# --- end spark ring ---/d" ~/.ssh/config 2>/dev/null; cat >> ~/.ssh/config'
-  done
+  # pin fabric host keys only when they match the LAN key
   : > /tmp/kh_add
   for r in "${ALL[@]}"; do
     a=$(ssh-keyscan -T 5 -t ed25519 "10.10.100.$((r+1))" 2>/dev/null | awk '{print $3}')
@@ -63,12 +90,16 @@ cmd_fabric(){
     echo "10.10.100.$((r+1)) ssh-ed25519 $a" >> /tmp/kh_add
   done
   for r in "${ALL[@]}"; do on "$r" 'grep -v "^10\.10\.100\." ~/.ssh/known_hosts > ~/.ssh/kh.tmp || true; cat >> ~/.ssh/kh.tmp; mv ~/.ssh/kh.tmp ~/.ssh/known_hosts' < /tmp/kh_add; done
-  for r in "${ALL[@]}"; do onf "$r" hostname; done
+  for r in "${ALL[@]}"; do onf "$r" hostname; for k in 1 2 3 4; do onf "$r" "ssh -n -o BatchMode=yes rk$k true" </dev/null \
+    || die "rank $r cannot ssh to rk$k over the fabric"; done; done
 }
 
 cmd_nccl(){
   local dst=/opt/nccl-switchless-4hca-fence
-  if onf 0 "test -f $dst/libnccl.so.2.30.7"; then log "NCCL already at $dst"; else
+  local shas
+  nccl_shas(){ for r in "${ALL[@]}"; do onf "$r" "sha256sum $dst/libnccl.so.2.30.7 2>/dev/null | cut -c1-16"; echo; done | { grep . || true; } | sort; }
+  shas=$(nccl_shas)
+  if [[ $(wc -l <<<"$shas") == 4 && $(uniq <<<"$shas" | wc -l) == 1 ]]; then log "NCCL already at $dst on all nodes"; else
     log "building NCCL 2.30.7 + switchless v0.0.1 + 4hca + #2393 fence on rk2"
     onf 1 'set -e; mkdir -p ~/nccl-build && cd ~/nccl-build
       [ -d ondigo ] || git clone -q https://github.com/ondigo-winder/SWITCHLESS-NCCL-RING-4-GB10.git ondigo
@@ -82,7 +113,8 @@ cmd_nccl(){
     onf 1 'tar -C ~ -cf - nccl-switchless-4hca-fence' > /tmp/nccl.tar
     for r in "${ALL[@]}"; do onf "$r" 'sudo tar -C /opt -xf -' < /tmp/nccl.tar; done
   fi
-  for r in "${ALL[@]}"; do onf "$r" "sha256sum $dst/libnccl.so.2.30.7 | cut -c1-16"; done | sort | uniq -c
+  shas=$(nccl_shas); uniq -c <<<"$shas"
+  [[ $(wc -l <<<"$shas") == 4 && $(uniq <<<"$shas" | wc -l) == 1 ]] || die "NCCL is not the same on all four nodes"
 }
 
 cmd_weights(){
@@ -152,6 +184,7 @@ cmd_hardening(){   # crash -> auto-reboot, hardware watchdog, uniform min_free, 
 }
 
 cmd_engine(){
+  [[ -f ~/.ssh/dsv41_ring ]] || cmd_ssh    # the profile's SSH_IDENTITY (installs from before this key existed)
   sed -e "s#@NODE_USER@#$NODE_USER#g" -e "s#@HOME@#$HOME#g" -e "s#^MODEL_DIR=.*#MODEL_DIR=$MODEL_DIR#" -e "s#^ENGRAM_DIR=.*#ENGRAM_DIR=$ENGRAM_DIR#" -e "s#^WORKER_ENGRAM_DIR=.*#WORKER_ENGRAM_DIR=$ENGRAM_DIR#" \
       -e "s#^SERVED_MODEL_NAME=.*#SERVED_MODEL_NAME=$SERVED_MODEL_NAME#" -e "s#^PORT=.*#PORT=$PORT#" -e "s#^API_KEY=.*#API_KEY=${API_KEY:-}#" \
       "$HERE/config/env.tp4" > "$WORK/engine/.env.tp4"
@@ -172,5 +205,5 @@ cmd_verify(){
 
 cmd_all(){ cmd_kernel; cmd_fabric; cmd_nccl; cmd_image; cmd_weights; cmd_engram; cmd_mesh; cmd_hardening; cmd_engine; log "done — ./install.sh verify"; }
 
-[[ $# -ge 1 ]] || { sed -n '2,18p' "$0"; exit 1; }
+[[ $# -ge 1 ]] || { sed -n '2,20p' "$0"; exit 1; }
 "cmd_$1"
