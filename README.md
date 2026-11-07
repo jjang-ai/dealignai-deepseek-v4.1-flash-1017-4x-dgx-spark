@@ -1,5 +1,18 @@
 # DeepSeek-V4.1-Flash-1017 UNCENSORED FP8 on 4x DGX Spark — switchless ring, TP4
 
+> **This is a fork of [knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4).**
+> The serving engine is knapcio's work: the SGLang serving profile, the TP4 launcher, the DSpark speculative decoding
+> setup and the tuning behind the decode speed. `./install.sh image` clones it at commit `506fb10` and applies one patch
+> on top ([patches/knapcio-506fb10-dsv411017.patch](patches/knapcio-506fb10-dsv411017.patch)). Our additions:
+> - adapting the engine to our UNCENSORED FP8 checkpoint;
+> - running it on a switchless 4-node ring instead of a switch: kernel and LTR fix, ring NCCL, opposite-node mesh;
+> - the prefill memory fix and prefix-cache eviction for four 1M sessions;
+> - model-id aliases and the edge proxy;
+> - setup, management, the guard and node hardening.
+>
+> Decode speed is knapcio's engine. If you have a switch, or the official checkpoint, start with knapcio's repository.
+> Details: [docs/COMPARISON.md](docs/COMPARISON.md). License: AGPL-3.0, same as upstream ([NOTICE](NOTICE)).
+
 Serving package for **our model, [`dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8`](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8)**,
 on four GB10 DGX Sparks cabled directly to each other (no switch). It is adapted and tuned specifically for this
 checkpoint (rev `c19ca5ca`, 510 GB: MXFP4 routed experts, FP8 dense, 203 GB Engram n-gram tables, DSpark draft):
